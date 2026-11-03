@@ -1,0 +1,11 @@
+[package]
+name = "diffdash"
+version = "0.1.0"
+edition = "2024"
+description = "Read-only TUI dashboard for lines added and deleted in a git repository"
+license = "MIT"
+homepage = "https://github.com/stellarjmr/diffdash"
+repository = "https://github.com/stellarjmr/diffdash"
+
+[dependencies]
+ratatui = "0.30.2"
