@@ -4,6 +4,8 @@ All notable changes to `diffdash` are tracked here.
 
 ## Unreleased
 
+## 0.2.1 - 2026-11-03
+
 - The tab bar at the top and the key hints at the bottom now sit in rounded boxes of their own, like the panels between them. They used to be bare lines of text above and below the boxed panels; now the whole screen has one look. Each bar takes three rows instead of one, so the panels get four fewer rows.
 
 ## 0.2.0 - 2026-11-03
