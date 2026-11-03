@@ -4,6 +4,8 @@ All notable changes to `diffdash` are tracked here.
 
 ## Unreleased
 
+- The tab bar at the top and the key hints at the bottom now sit in rounded boxes of their own, like the panels between them. They used to be bare lines of text above and below the boxed panels; now the whole screen has one look. Each bar takes three rows instead of one, so the panels get four fewer rows.
+
 ## 0.2.0 - 2026-11-03
 
 - New **Branches** tab (key `4`). Log and Stats only follow HEAD, so work on another branch, such as an agent's branch in its own worktree, did not show up until it was merged. The tab lists every local branch with commits ahead of and behind the current branch, and the files and `+/-` lines it changed since its merge base with HEAD (the range a pull request shows). The lower pane lists the selected branch's files; Enter opens the whole branch diff in less. The tab refreshes by itself when any branch tip moves. Comparisons are cached by HEAD and tip commit, so only branches that moved are recomputed. A branch with no common history shows that on its own row instead of failing the tab. `--once` prints a Branches section too.

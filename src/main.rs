@@ -716,8 +716,10 @@ impl App {
     // ------------------------------------------------------------ render
 
     fn render(&mut self, f: &mut Frame) {
+        // The tab bar and the key hints are boxed like the panels between
+        // them, so each takes three rows.
         let [top, body, bottom] =
-            Layout::vertical([Constraint::Length(1), Constraint::Fill(1), Constraint::Length(1)]).areas(f.area());
+            Layout::vertical([Constraint::Length(3), Constraint::Fill(1), Constraint::Length(3)]).areas(f.area());
         self.render_top(f, top);
         match self.tab {
             0 => self.render_changes(f, body),
@@ -730,7 +732,9 @@ impl App {
 
     fn render_top(&self, f: &mut Frame, area: Rect) {
         let branch = self.work.as_ref().map_or("…", |w| w.branch.as_str());
-        let mut spans = Vec::from(pill(" diffdash ", Some(ACCENT)));
+        // Leading space so the pill cap does not touch the border.
+        let mut spans = vec![Span::raw(" ")];
+        spans.extend(pill(" diffdash ", Some(ACCENT)));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(repo_name(&self.repo.root), Style::new().bold()));
         spans.push(Span::styled(format!("  {branch}   "), Style::new().fg(Color::Magenta)));
@@ -742,7 +746,7 @@ impl App {
                 spans.extend(pill_slot(label, Style::new().fg(DIM)));
             }
         }
-        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        f.render_widget(Paragraph::new(Line::from(spans)).block(panel()), area);
     }
 
     fn render_bottom(&self, f: &mut Frame, area: Rect) {
@@ -760,7 +764,7 @@ impl App {
         if let Some(e) = self.errors.iter().flatten().next() {
             spans.push(Span::styled(format!("  {e}"), Style::new().fg(DEL)));
         }
-        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        f.render_widget(Paragraph::new(Line::from(spans)).block(panel()), area);
     }
 
     fn render_changes(&mut self, f: &mut Frame, area: Rect) {
