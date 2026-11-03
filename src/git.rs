@@ -155,6 +155,23 @@ const BRANCH_FORMAT: &str =
 
 // ---------------------------------------------------------------- running git
 
+/// Base command for every git call, so the read-only settings cannot be left
+/// out. Both keep diffdash from writing `.git/index`, which would take
+/// `.git/index.lock` and could make a concurrent `git commit` (e.g. by an
+/// agent) fail:
+/// - `--no-optional-locks`: `git status` and friends skip their index refresh.
+/// - `diff.autoRefreshIndex=false`: `git diff` still refreshes and rewrites the
+///   index for a file with new stat data but unchanged content (a file
+///   rewritten as-is), even with `--no-optional-locks`.
+pub fn git_cmd(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(dir)
+        .args(["-c", "core.quotePath=false", "-c", "diff.autoRefreshIndex=false"])
+        .args(["--no-pager", "--no-optional-locks"]);
+    cmd
+}
+
 /// Cached line count of an untracked file, keyed by path and invalidated by
 /// modification time and size.
 struct CachedCount {
@@ -173,9 +190,7 @@ pub struct Repo {
 
 impl Repo {
     pub fn open(path: &Path) -> Result<Repo, String> {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(path)
+        let out = git_cmd(path)
             .args(["rev-parse", "--show-toplevel"])
             .output()
             .map_err(|e| format!("failed to run git: {e}"))?;
@@ -195,12 +210,7 @@ impl Repo {
     }
 
     fn git(&self, args: &[&str]) -> Result<Vec<u8>, String> {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&self.root)
-            // --no-optional-locks: never take .git/index.lock while polling, so
-            // diffdash cannot make a concurrent `git commit` (e.g. by an agent) fail.
-            .args(["-c", "core.quotePath=false", "--no-pager", "--no-optional-locks"])
+        let out = git_cmd(&self.root)
             .args(args)
             .output()
             .map_err(|e| format!("failed to run git: {e}"))?;
@@ -770,6 +780,31 @@ mod tests {
         assert_eq!(first, second);
 
         fs::remove_dir_all(&wt).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn poll_never_rewrites_index() {
+        let dir = std::env::temp_dir().join(format!("diffdash-index-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        setup_git(&dir, &["init", "-q", "-b", "main"]);
+        fs::write(dir.join("a.txt"), "same\n").unwrap();
+        setup_git(&dir, &["add", "-A"]);
+        setup_git(&dir, &["commit", "-qm", "init"]);
+        // Same content, new mtime: what an agent or formatter rewriting a file
+        // unchanged leaves behind. `git diff` refreshes the index for such a
+        // file unless told not to, and --no-optional-locks alone does not stop it.
+        let file = fs::File::options().write(true).open(dir.join("a.txt")).unwrap();
+        file.set_modified(SystemTime::now() + std::time::Duration::from_secs(3600)).unwrap();
+        drop(file);
+        let index = dir.join(".git/index");
+        let before = fs::read(&index).unwrap();
+
+        let repo = Repo::open(&dir).unwrap();
+        let w = repo.worktree().unwrap();
+        assert!(w.unstaged.is_empty() && w.vs_head.is_empty(), "same content is not a change");
+        assert!(fs::read(&index).unwrap() == before, "polling rewrote .git/index (took index.lock)");
         fs::remove_dir_all(&dir).unwrap();
     }
 

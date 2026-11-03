@@ -1182,10 +1182,7 @@ fn clamp(state: &mut TableState, len: usize) {
 
 /// Pipe `git <args>` into `less -R`.
 fn page_git(root: &Path, args: &[String]) -> Result<(), String> {
-    let mut git = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["-c", "core.quotePath=false", "--no-pager"])
+    let mut git = git::git_cmd(root)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
