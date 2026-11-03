@@ -19,14 +19,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Cell, Paragraph, Row, Table, TableState};
 use ratatui::{DefaultTerminal, Frame};
 
-use git::{Bucket, Commit, FileStat, Log, Repo, Stats, WorkTree, totals};
+use git::{Branch, Branches, Bucket, Commit, FileStat, Log, Repo, Stats, WorkTree, totals};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const REFRESH: Duration = Duration::from_secs(2);
 const BAR: usize = 24;
 const RANGES: [(&str, Option<u32>); 4] =
     [("7d", Some(7)), ("30d", Some(30)), ("90d", Some(90)), ("all", None)];
-const TABS: [&str; 3] = ["Changes", "Log", "Stats"];
+// New tabs go at the end so existing number keys keep their meaning.
+const TABS: [&str; 4] = ["Changes", "Log", "Stats", "Branches"];
 
 // Only ANSI palette colors and REVERSED, so the UI follows the terminal theme
 // (light or dark).
@@ -89,16 +90,16 @@ Usage: diffdash [PATH] [options]
 Options:
   -n, --limit N     commits loaded in the Log tab (default 300)
   -r, --range R     initial Stats range: 7d, 30d, 90d, all (default 30d)
-      --once        print all three views as plain text and exit
+      --once        print all four views as plain text and exit
                     (the Log section shows at most 30 commits)
   -h, --help        show this help
   -V, --version     show version
 
 Keys:
-  1 2 3 / Tab       switch tab (Changes, Log, Stats)
+  1 2 3 4 / Tab     switch tab (Changes, Log, Stats, Branches)
   j k / arrows      move        g G   top / bottom
   Ctrl-d Ctrl-u     page down / up (also PageDown / PageUp)
-  Enter             open the diff of the selected file or commit in less
+  Enter             open the diff of the selected file, commit or branch in less
   t                 cycle Stats range
   r                 refresh now
   q / Esc           quit"
@@ -223,6 +224,7 @@ fn print_once(repo: &Repo, o: &Opts) -> Result<(), String> {
     let log = repo.log(o.limit.min(30))?;
     let (rname, rdays) = RANGES[o.range];
     let stats = repo.stats(rdays)?;
+    let br = repo.branches()?;
     let mut out = String::new();
     let all: Vec<&FileStat> = w.staged.iter().chain(&w.unstaged).chain(&w.untracked).collect();
     let max = all.iter().map(|f| churn(f)).max().unwrap_or(0);
@@ -281,6 +283,31 @@ fn print_once(repo: &Repo, o: &Opts) -> Result<(), String> {
             );
         }
     }
+
+    out += &format!("\n== Branches (compared with {} from the merge base)\n", br.head_name);
+    let max = br.list.iter().map(branch_churn).max().unwrap_or(0);
+    for b in &br.list {
+        let mark = if b.current { '*' } else { ' ' };
+        let info = match &b.cmp {
+            Some(Ok(c)) => {
+                let (a, d) = totals(&c.files);
+                format!(
+                    "{:>4} ahead {:>5} behind {:>4}f {:>7}{:>7}  {}",
+                    c.ahead,
+                    c.behind,
+                    c.files.len(),
+                    plus(a),
+                    minus(d),
+                    bar_text(a, d, max)
+                )
+            }
+            Some(Err(e)) => e.clone(),
+            None if b.current => "current".into(),
+            None => String::new(),
+        };
+        let wt = b.worktree.as_ref().map(|p| format!("  [worktree {}]", tilde(p))).unwrap_or_default();
+        out += &format!("{mark} {} {} {}{wt}\n", pad(&b.name, 24), pad(&info, 70), b.rel_date);
+    }
     io::stdout().write_all(out.as_bytes()).map_err(|e| e.to_string())
 }
 
@@ -302,6 +329,7 @@ enum Msg {
     Work(Result<WorkTree, String>),
     Log(u64, Result<Log, String>),
     Stats(u64, Result<Stats, String>),
+    Branches(u64, Result<Branches, String>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -330,21 +358,27 @@ struct App {
     log_state: TableState,
     stats: Option<Stats>,
     stats_state: TableState,
-    busy: [bool; 3],
+    branches: Option<Branches>,
+    branch_state: TableState,
+    /// Background job running, per source (WORK, LOG, STATS, BRANCHES).
+    busy: [bool; 4],
     log_gen: u64,
     stats_gen: u64,
+    branch_gen: u64,
     last_head: Option<String>,
+    last_tips: Option<String>,
     last_work: Instant,
-    /// Last error per source (WORK, LOG, STATS, PAGER); cleared by that
-    /// source's next success, so one source never hides another's failure.
-    errors: [Option<String>; 4],
+    /// Last error per source (WORK, LOG, STATS, BRANCHES, PAGER); cleared by
+    /// that source's next success, so one source never hides another's failure.
+    errors: [Option<String>; 5],
     quit: bool,
 }
 
 const WORK: usize = 0;
 const LOG: usize = 1;
 const STATS: usize = 2;
-const PAGER: usize = 3;
+const BRANCHES: usize = 3;
+const PAGER: usize = 4;
 
 impl App {
     fn new(repo: Arc<Repo>, o: &Opts) -> App {
@@ -363,10 +397,14 @@ impl App {
             log_state: TableState::default(),
             stats: None,
             stats_state: TableState::default(),
-            busy: [false; 3],
+            branches: None,
+            branch_state: TableState::default(),
+            busy: [false; 4],
             log_gen: 0,
             stats_gen: 0,
+            branch_gen: 0,
             last_head: None,
+            last_tips: None,
             last_work: Instant::now(),
             errors: Default::default(),
             quit: false,
@@ -374,10 +412,10 @@ impl App {
     }
 
     fn spawn_work(&mut self) {
-        if self.busy[0] {
+        if self.busy[WORK] {
             return;
         }
-        self.busy[0] = true;
+        self.busy[WORK] = true;
         self.last_work = Instant::now();
         let (repo, tx) = (self.repo.clone(), self.tx.clone());
         thread::spawn(move || {
@@ -386,7 +424,7 @@ impl App {
     }
 
     fn spawn_log(&mut self) {
-        self.busy[1] = true;
+        self.busy[LOG] = true;
         self.log_gen += 1;
         let (repo, tx, limit, generation) = (self.repo.clone(), self.tx.clone(), self.limit, self.log_gen);
         thread::spawn(move || {
@@ -395,7 +433,7 @@ impl App {
     }
 
     fn spawn_stats(&mut self) {
-        self.busy[2] = true;
+        self.busy[STATS] = true;
         self.stats_gen += 1;
         let (repo, tx, generation) = (self.repo.clone(), self.tx.clone(), self.stats_gen);
         let days = RANGES[self.range].1;
@@ -404,10 +442,20 @@ impl App {
         });
     }
 
+    fn spawn_branches(&mut self) {
+        self.busy[BRANCHES] = true;
+        self.branch_gen += 1;
+        let (repo, tx, generation) = (self.repo.clone(), self.tx.clone(), self.branch_gen);
+        thread::spawn(move || {
+            let _ = tx.send(Msg::Branches(generation, repo.branches()));
+        });
+    }
+
     fn refresh_all(&mut self) {
         self.spawn_work();
         self.spawn_log();
         self.spawn_stats();
+        self.spawn_branches();
     }
 
     fn handle_msg(&mut self, msg: Msg) {
@@ -417,12 +465,21 @@ impl App {
                 match r {
                     Ok(w) => {
                         let head_changed = self.last_head.as_ref().is_some_and(|h| *h != w.head);
+                        // A branch can move while HEAD stays put, e.g. an agent
+                        // committing in another worktree.
+                        let tips_changed = self.last_tips.as_ref().is_some_and(|t| *t != w.branch_tips);
                         self.last_head = Some(w.head.clone());
+                        self.last_tips = Some(w.branch_tips.clone());
                         self.set_work(w);
                         self.errors[WORK] = None;
                         if head_changed {
                             self.spawn_log();
                             self.spawn_stats();
+                        }
+                        // Every comparison is against HEAD, so HEAD moving
+                        // changes all of them.
+                        if head_changed || tips_changed {
+                            self.spawn_branches();
                         }
                     }
                     Err(e) => self.errors[WORK] = Some(e),
@@ -455,6 +512,19 @@ impl App {
                         self.errors[STATS] = None;
                     }
                     Err(e) => self.errors[STATS] = Some(e),
+                }
+            }
+            Msg::Branches(generation, r) => {
+                if generation != self.branch_gen {
+                    return;
+                }
+                self.busy[BRANCHES] = false;
+                match r {
+                    Ok(b) => {
+                        self.set_branches(b);
+                        self.errors[BRANCHES] = None;
+                    }
+                    Err(e) => self.errors[BRANCHES] = Some(e),
                 }
             }
         }
@@ -513,6 +583,21 @@ impl App {
         log.commits.get(i)
     }
 
+    /// Keeps the selection on the same branch by name; the list is sorted by
+    /// commit date, so a branch that just got a commit moves to the top.
+    fn set_branches(&mut self, b: Branches) {
+        let keep = self.selected_branch().map(|x| x.name.clone());
+        if let Some(i) = keep.and_then(|n| b.list.iter().position(|x| x.name == n)) {
+            self.branch_state.select(Some(i));
+        }
+        clamp(&mut self.branch_state, b.list.len());
+        self.branches = Some(b);
+    }
+
+    fn selected_branch(&self) -> Option<&Branch> {
+        self.branches.as_ref()?.list.get(self.branch_state.selected()?)
+    }
+
     /// Move selection by `delta`, skipping section headers.
     fn move_work(&mut self, delta: isize) {
         let rows = &self.work_rows;
@@ -529,9 +614,13 @@ impl App {
         match self.tab {
             0 => self.move_work(delta),
             1 => self.move_log(delta),
-            _ => {
+            2 => {
                 let n = self.stats.as_ref().map_or(0, |s| s.by_day.len());
                 step(&mut self.stats_state, n, delta, |_| true);
+            }
+            _ => {
+                let n = self.branches.as_ref().map_or(0, |b| b.list.len());
+                step(&mut self.branch_state, n, delta, |_| true);
             }
         }
     }
@@ -558,6 +647,18 @@ impl App {
             1 => {
                 let Some(c) = self.selected_commit() else { return Ok(()) };
                 vec!["show".into(), "--color=always".into(), "--stat".into(), "--patch".into(), c.hash.clone()]
+            }
+            3 => {
+                // The whole branch since the merge base, the same range the
+                // numbers come from. Nothing to page for an empty diff.
+                let Some(b) = self.selected_branch() else { return Ok(()) };
+                let Some(Ok(c)) = &b.cmp else { return Ok(()) };
+                if c.files.is_empty() {
+                    return Ok(());
+                }
+                let mut a: Vec<String> = ["diff", "--color=always", "--stat", "--patch"].map(String::from).into();
+                a.extend([c.merge_base.clone(), b.tip.clone(), "--".into()]);
+                a
             }
             _ => return Ok(()),
         };
@@ -592,8 +693,9 @@ impl App {
             KeyCode::Char('1') => self.tab = 0,
             KeyCode::Char('2') => self.tab = 1,
             KeyCode::Char('3') => self.tab = 2,
-            KeyCode::Tab => self.tab = (self.tab + 1) % 3,
-            KeyCode::BackTab => self.tab = (self.tab + 2) % 3,
+            KeyCode::Char('4') => self.tab = 3,
+            KeyCode::Tab => self.tab = (self.tab + 1) % TABS.len(),
+            KeyCode::BackTab => self.tab = (self.tab + TABS.len() - 1) % TABS.len(),
             KeyCode::Char('j') | KeyCode::Down => self.move_sel(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_sel(-1),
             KeyCode::PageDown => self.move_sel(15),
@@ -620,7 +722,8 @@ impl App {
         match self.tab {
             0 => self.render_changes(f, body),
             1 => self.render_log(f, body),
-            _ => self.render_stats(f, body),
+            2 => self.render_stats(f, body),
+            _ => self.render_branches(f, body),
         }
         self.render_bottom(f, bottom);
     }
@@ -644,13 +747,14 @@ impl App {
 
     fn render_bottom(&self, f: &mut Frame, area: Rect) {
         let hint = match self.tab {
-            0 => "j/k move · Enter diff · r refresh · 1-3 tabs · q quit",
-            1 => "j/k move · Enter show commit · r refresh · 1-3 tabs · q quit",
-            _ => "t range · j/k scroll · r refresh · 1-3 tabs · q quit",
+            0 => "j/k move · Enter diff · r refresh · 1-4 tabs · q quit",
+            1 => "j/k move · Enter show commit · r refresh · 1-4 tabs · q quit",
+            2 => "t range · j/k scroll · r refresh · 1-4 tabs · q quit",
+            _ => "j/k move · Enter branch diff · r refresh · 1-4 tabs · q quit",
         };
         let mut spans = vec![Span::styled(format!(" {hint}"), Style::new().fg(DIM))];
         // The 2 s working-tree poll is not shown; it would flicker constantly.
-        if self.busy[LOG] || self.busy[STATS] {
+        if self.busy[LOG] || self.busy[STATS] || self.busy[BRANCHES] {
             spans.push(Span::styled("  loading…", Style::new().fg(ACCENT)));
         }
         if let Some(e) = self.errors.iter().flatten().next() {
@@ -819,6 +923,166 @@ impl App {
         f.render_stateful_widget(days, left, &mut self.stats_state);
         f.render_widget(bucket_table(&s.by_dir, 18, rtop).block(boxed(" By top-level directory ")), rtop);
         f.render_widget(bucket_table(&s.by_author, 18, rbot).block(boxed(" By author ")), rbot);
+    }
+
+    fn render_branches(&mut self, f: &mut Frame, area: Rect) {
+        let Some(br) = &self.branches else {
+            f.render_widget(self.placeholder(BRANCHES), area);
+            return;
+        };
+        let title = format!(" Branches · {} local · compared with {} ", br.list.len(), br.head_name);
+        if br.list.is_empty() {
+            f.render_widget(Paragraph::new(" no branches yet").fg(DIM).block(panel().title(title)), area);
+            return;
+        }
+        // Branch lists are usually short; the selected branch's files get the rest.
+        let list_h = (br.list.len() as u16 + 2).min(area.height / 2).max(3);
+        let [top, bottom] = Layout::vertical([Constraint::Length(list_h), Constraint::Fill(1)]).areas(area);
+        // Counts and date have fixed widths. The name column fits the longest
+        // name and the bar gets what is left, so a narrow terminal shrinks the
+        // bar instead of hiding branch names.
+        const FIXED: u16 = 9 + 11 + 5 + 7 + 7 + 14 + 7; // six columns, seven gaps
+        let names: Vec<Line<'static>> = br.list.iter().map(branch_name).collect();
+        let name_w = names.iter().map(Line::width).max().unwrap_or(0) as u16;
+        let room = area.width.saturating_sub(2 + FIXED);
+        let bar_col = room.saturating_sub(name_w).min(BAR as u16 + 1);
+        let bar_w = bar_col.saturating_sub(1) as usize;
+        let max = br.list.iter().map(branch_churn).max().unwrap_or(0);
+        let rows: Vec<Row> = br.list.iter().zip(names).map(|(b, name)| branch_row(b, name, max, bar_w)).collect();
+        let widths = [
+            Constraint::Fill(1),
+            Constraint::Length(9),
+            Constraint::Length(11),
+            Constraint::Length(5),
+            Constraint::Length(7),
+            Constraint::Length(7),
+            Constraint::Length(bar_col),
+            Constraint::Length(14),
+        ];
+        let table = Table::new(rows, widths)
+            .block(panel().title(title))
+            .row_highlight_style(selected_style());
+        f.render_stateful_widget(table, top, &mut self.branch_state);
+
+        let Some(b) = self.selected_branch() else {
+            f.render_widget(panel(), bottom);
+            return;
+        };
+        let mut block = panel();
+        if let Some(path) = &b.worktree {
+            // The note goes first so a long path is what gets cut off.
+            let note = format!(" uncommitted changes in its worktree are not counted · {} ", tilde(path));
+            block = block.title_bottom(Line::from(note).fg(DIM));
+        }
+        let name = Span::styled(format!(" {} ", b.name), Style::new().fg(Color::Magenta).bold());
+        let c = match &b.cmp {
+            Some(Ok(c)) => c,
+            other => {
+                let (title, text, color) = match other {
+                    _ if b.current => (
+                        "· current branch ",
+                        " the other branches are compared with this one, from where they forked".to_string(),
+                        DIM,
+                    ),
+                    Some(Err(e)) => ("", format!(" {e}"), DEL),
+                    _ => ("", " HEAD has no commits yet, so there is nothing to compare with".to_string(), DIM),
+                };
+                let block = block.title(Line::from(vec![name, Span::raw(title)]));
+                f.render_widget(Paragraph::new(text).fg(color).block(block), bottom);
+                return;
+            }
+        };
+        let (a, d) = totals(&c.files);
+        let title = Line::from(vec![
+            name,
+            Span::raw(format!(
+                "· {} ahead, {} behind · merge base {} · {} files  ",
+                c.ahead,
+                c.behind,
+                &c.merge_base[..c.merge_base.len().min(7)],
+                c.files.len()
+            )),
+            Span::styled(plus(a), Style::new().fg(ADD).bold()),
+            Span::raw(" "),
+            Span::styled(minus(d), Style::new().fg(DEL).bold()),
+            Span::raw(" "),
+        ]);
+        let block = block.title(title);
+        if c.files.is_empty() {
+            let msg = if c.ahead == 0 {
+                format!(" every commit on this branch is already in {}", br.head_name)
+            } else {
+                " no file changes since the merge base".to_string()
+            };
+            f.render_widget(Paragraph::new(msg).fg(DIM).block(block), bottom);
+            return;
+        }
+        let mut files: Vec<&FileStat> = c.files.iter().collect();
+        files.sort_by_key(|f| std::cmp::Reverse(churn(f)));
+        let max = files.first().map_or(0, |f| churn(f));
+        let rows: Vec<Row> = files.iter().map(|f| file_row(f, max, false)).collect();
+        f.render_widget(file_table(rows).block(block), bottom);
+    }
+}
+
+fn branch_churn(b: &Branch) -> u64 {
+    match &b.cmp {
+        Some(Ok(c)) => {
+            let (a, d) = totals(&c.files);
+            a + d
+        }
+        _ => 0,
+    }
+}
+
+/// Name cell of a branch row: current-branch marker, name and dim tags.
+fn branch_name(b: &Branch) -> Line<'static> {
+    let (mark, style) = if b.current {
+        ("* ", Style::new().fg(Color::Magenta).bold())
+    } else {
+        ("  ", Style::new())
+    };
+    let mut spans = vec![Span::raw(format!(" {mark}")), Span::styled(b.name.clone(), style)];
+    if b.worktree.is_some() {
+        spans.push(Span::styled(" worktree", Style::new().fg(DIM)));
+    }
+    if let Some(Err(_)) = &b.cmp {
+        spans.push(Span::styled("  no common history", Style::new().fg(DIM)));
+    }
+    Line::from(spans)
+}
+
+fn branch_row(b: &Branch, name: Line<'static>, max: u64, bar_w: usize) -> Row<'static> {
+    let mut cells = vec![Cell::from(name)];
+    match &b.cmp {
+        Some(Ok(c)) => {
+            let (a, d) = totals(&c.files);
+            // Zero counts are dimmed so branches with work stand out.
+            let count = |n: u64, what: &str| {
+                let line = Line::from(format!("{n} {what}")).right_aligned();
+                Cell::from(if n == 0 { line.fg(DIM) } else { line })
+            };
+            cells.extend([
+                count(c.ahead, "ahead"),
+                count(c.behind, "behind"),
+                Cell::from(Line::from(format!("{}f", c.files.len())).right_aligned().fg(DIM)),
+                Cell::from(Line::from(plus(a)).right_aligned().fg(ADD)),
+                Cell::from(Line::from(minus(d)).right_aligned().fg(DEL)),
+                Cell::from(bar_line(a, d, max, bar_w)),
+            ]);
+        }
+        _ => cells.extend((0..6).map(|_| Cell::from(""))),
+    }
+    cells.push(Cell::from(Line::from(b.rel_date.clone()).fg(DIM)));
+    Row::new(cells)
+}
+
+/// `path` with the home directory shown as `~`.
+fn tilde(path: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    match path.strip_prefix(home.as_str()) {
+        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => format!("~{rest}"),
+        _ => path.to_string(),
     }
 }
 

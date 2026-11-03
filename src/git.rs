@@ -53,6 +53,10 @@ pub struct WorkTree {
     /// Tracked changes from HEAD to the working tree in one diff. Used for the
     /// headline totals so a file both staged and unstaged is not counted twice.
     pub vs_head: Vec<FileStat>,
+    /// Every local branch tip plus the current-branch marker. Only compared
+    /// between polls, to notice when the Branches tab is stale (for example
+    /// an agent committing in another worktree, which leaves HEAD alone).
+    pub branch_tips: String,
 }
 
 impl WorkTree {
@@ -109,6 +113,46 @@ pub struct Stats {
     pub by_author: Vec<Bucket>,
 }
 
+/// One local branch, compared with HEAD.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Branch {
+    pub name: String,
+    /// Full commit hash of the branch tip.
+    pub tip: String,
+    /// HEAD points at this branch.
+    pub current: bool,
+    pub rel_date: String,
+    /// Path of another worktree that has this branch checked out.
+    pub worktree: Option<String>,
+    /// `None` for the current branch and before the first commit. `Err` when
+    /// this one branch cannot be compared, e.g. it shares no history with HEAD.
+    pub cmp: Option<Result<BranchCmp, String>>,
+}
+
+/// What a branch changed since it forked from HEAD: the same range as
+/// `git diff HEAD...branch`, which is what a pull request shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchCmp {
+    pub merge_base: String,
+    /// Commits on the branch that HEAD does not have.
+    pub ahead: u64,
+    /// Commits on HEAD that the branch does not have.
+    pub behind: u64,
+    pub files: Vec<FileStat>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Branches {
+    /// What the branches are compared with: HEAD's branch or `(detached …)`.
+    pub head_name: String,
+    /// Most recently committed first.
+    pub list: Vec<Branch>,
+}
+
+/// `git for-each-ref` format read by [`parse_branches`].
+const BRANCH_FORMAT: &str =
+    "--format=%1e%(HEAD)%1f%(refname:short)%1f%(objectname)%1f%(committerdate:relative)%1f%(worktreepath)";
+
 // ---------------------------------------------------------------- running git
 
 /// Cached line count of an untracked file, keyed by path and invalidated by
@@ -122,6 +166,9 @@ struct CachedCount {
 pub struct Repo {
     pub root: PathBuf,
     untracked_cache: Mutex<HashMap<String, CachedCount>>,
+    /// Branch comparisons keyed by `(HEAD, tip)` commit hashes. Commits never
+    /// change, so an entry stays valid until HEAD or the branch moves.
+    branch_cache: Mutex<HashMap<(String, String), BranchCmp>>,
 }
 
 impl Repo {
@@ -136,7 +183,15 @@ impl Repo {
             return Err(format!("not a git repository: {}", path.display()));
         }
         let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        Ok(Repo { root: PathBuf::from(root), untracked_cache: Mutex::new(HashMap::new()) })
+        Ok(Repo::at(PathBuf::from(root)))
+    }
+
+    fn at(root: PathBuf) -> Repo {
+        Repo {
+            root,
+            untracked_cache: Mutex::new(HashMap::new()),
+            branch_cache: Mutex::new(HashMap::new()),
+        }
     }
 
     fn git(&self, args: &[&str]) -> Result<Vec<u8>, String> {
@@ -166,16 +221,23 @@ impl Repo {
             .unwrap_or_default()
     }
 
-    pub fn worktree(&self) -> Result<WorkTree, String> {
-        let mut branch = self.git_str(&["symbolic-ref", "--short", "-q", "HEAD"]);
+    /// HEAD's commit hash (empty before the first commit) and its display
+    /// name: the branch, or `(detached abc1234)`.
+    fn head(&self) -> (String, String) {
         let head = self.git_str(&["rev-parse", "-q", "--verify", "HEAD"]);
-        if branch.is_empty() {
-            branch = if head.is_empty() {
+        let mut name = self.git_str(&["symbolic-ref", "--short", "-q", "HEAD"]);
+        if name.is_empty() {
+            name = if head.is_empty() {
                 "(no commits)".into()
             } else {
                 format!("(detached {})", &head[..head.len().min(7)])
             };
         }
+        (head, name)
+    }
+
+    pub fn worktree(&self) -> Result<WorkTree, String> {
+        let (head, branch) = self.head();
         // Before the first commit there is no HEAD; diff against the empty tree.
         let base = if head.is_empty() {
             self.git_str(&["hash-object", "-t", "tree", "/dev/null"])
@@ -187,7 +249,8 @@ impl Repo {
         let vs_head = parse_numstat_z(&self.git(&["diff", "--numstat", "-z", &base])?);
         let listed = self.git(&["ls-files", "--others", "--exclude-standard", "-z"])?;
         let untracked = self.untracked_stats(split_z(&listed));
-        Ok(WorkTree { branch, head, staged, unstaged, untracked, vs_head })
+        let branch_tips = self.git_str(&["for-each-ref", "--format=%(HEAD)%(objectname) %(refname)", "refs/heads"]);
+        Ok(WorkTree { branch, head, staged, unstaged, untracked, vs_head, branch_tips })
     }
 
     /// Line counts for untracked files, re-reading a file only when its
@@ -261,6 +324,47 @@ impl Repo {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let body = self.git(&refs)?;
         Ok(aggregate(&parse_log(&String::from_utf8_lossy(&body))))
+    }
+
+    /// Local branches, most recently committed first, each compared with HEAD.
+    pub fn branches(&self) -> Result<Branches, String> {
+        let (head, head_name) = self.head();
+        let out = self.git(&["for-each-ref", "--sort=-committerdate", BRANCH_FORMAT, "refs/heads"])?;
+        let mut list = parse_branches(&String::from_utf8_lossy(&out));
+        let mut cache = self.branch_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fresh = HashMap::new();
+        for b in list.iter_mut().filter(|b| !b.current && !head.is_empty()) {
+            let key = (head.clone(), b.tip.clone());
+            let cmp = match fresh.get(&key).cloned().or_else(|| cache.remove(&key)) {
+                Some(c) => Ok(c),
+                None => self.compare(&head, &b.tip),
+            };
+            // Errors are not cached, so a failure is retried on the next reload.
+            if let Ok(c) = &cmp {
+                fresh.insert(key, c.clone());
+            }
+            b.cmp = Some(cmp);
+        }
+        // Entries for branches or a HEAD that moved on are dropped here.
+        *cache = fresh;
+        Ok(Branches { head_name, list })
+    }
+
+    /// Compare a branch tip with HEAD from their merge base.
+    fn compare(&self, head: &str, tip: &str) -> Result<BranchCmp, String> {
+        // With no common ancestor `git merge-base` prints nothing and exits 1,
+        // which `git()` accepts; detect it here instead of matching git's
+        // (possibly translated) error text.
+        let merge_base = String::from_utf8_lossy(&self.git(&["merge-base", head, tip])?).trim().to_string();
+        if merge_base.is_empty() {
+            return Err("no common history with HEAD".into());
+        }
+        let range = format!("{head}...{tip}");
+        let counts = self.git(&["rev-list", "--left-right", "--count", &range])?;
+        let (behind, ahead) = parse_left_right(&String::from_utf8_lossy(&counts))
+            .ok_or_else(|| format!("unexpected git rev-list output for {range}"))?;
+        let files = parse_numstat_z(&self.git(&["diff", "--numstat", "-z", &merge_base, tip, "--"])?);
+        Ok(BranchCmp { merge_base, ahead, behind, files })
     }
 }
 
@@ -404,6 +508,35 @@ pub fn parse_graph(text: &str, commits: &[Commit]) -> Vec<GraphRow> {
         .collect()
 }
 
+/// Parse `git for-each-ref` output written with [`BRANCH_FORMAT`].
+pub fn parse_branches(text: &str) -> Vec<Branch> {
+    text.split('\x1e')
+        .filter_map(|record| {
+            let f: Vec<&str> = record.trim_end_matches('\n').splitn(5, '\x1f').collect();
+            if f.len() < 5 {
+                return None;
+            }
+            let current = f[0] == "*";
+            Some(Branch {
+                name: f[1].into(),
+                tip: f[2].into(),
+                current,
+                rel_date: f[3].into(),
+                // The current branch is checked out here. Any other branch with
+                // a path is checked out in another worktree.
+                worktree: (!current && !f[4].is_empty()).then(|| f[4].to_string()),
+                cmp: None,
+            })
+        })
+        .collect()
+}
+
+/// Parse `git rev-list --left-right --count A...B` (`left\tright`).
+pub fn parse_left_right(text: &str) -> Option<(u64, u64)> {
+    let mut it = text.split_whitespace();
+    Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+}
+
 fn top_dir(path: &str) -> String {
     match path.split_once('/') {
         Some((dir, _)) => format!("{dir}/"),
@@ -537,6 +670,110 @@ mod tests {
     }
 
     #[test]
+    fn branch_records() {
+        let text = "\x1e*\x1fmain\x1faaa\x1f2 hours ago\x1f/work/repo\n\
+                    \x1e \x1fagent/x\x1fbbb\x1f5 minutes ago\x1f/work/repo-wt\n\
+                    \x1e \x1fold\x1fccc\x1f3 weeks ago\x1f\n";
+        let got = parse_branches(text);
+        assert_eq!(got.len(), 3);
+        assert!(got[0].current);
+        assert_eq!((got[0].name.as_str(), got[0].tip.as_str()), ("main", "aaa"));
+        // The current branch's own checkout is not "another worktree".
+        assert_eq!(got[0].worktree, None);
+        assert!(!got[1].current);
+        assert_eq!(got[1].worktree.as_deref(), Some("/work/repo-wt"));
+        assert_eq!(got[1].rel_date, "5 minutes ago");
+        assert_eq!(got[2].worktree, None);
+        assert!(got.iter().all(|b| b.cmp.is_none()));
+    }
+
+    #[test]
+    fn left_right_counts() {
+        assert_eq!(parse_left_right("1\t3\n"), Some((1, 3)));
+        assert_eq!(parse_left_right(""), None);
+        assert_eq!(parse_left_right("x\t1"), None);
+    }
+
+    /// Run git for test setup, isolated from the user's config (signing, hooks).
+    fn setup_git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn branches_compare_from_merge_base() {
+        let dir = std::env::temp_dir().join(format!("diffdash-branches-{}", std::process::id()));
+        let wt = dir.with_extension("wt");
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&wt);
+        fs::create_dir_all(&dir).unwrap();
+        let commit = |files: &[(&str, &str)], msg: &str| {
+            for (name, body) in files {
+                fs::write(dir.join(name), body).unwrap();
+            }
+            setup_git(&dir, &["add", "-A"]);
+            setup_git(&dir, &["commit", "-qm", msg]);
+        };
+        setup_git(&dir, &["init", "-q", "-b", "main"]);
+        commit(&[("f.txt", "a\nb\nc\n")], "base");
+        setup_git(&dir, &["switch", "-qc", "feature"]);
+        commit(&[("f.txt", "a\nb\nc\nd\ne\n"), ("new.rs", "1\n2\n3\n4\n")], "feature work");
+        setup_git(&dir, &["switch", "-q", "main"]);
+        commit(&[("m.txt", "m\n")], "main moves on");
+        setup_git(&dir, &["branch", "old", "HEAD~1"]);
+        setup_git(&dir, &["switch", "-q", "--orphan", "lonely"]);
+        commit(&[("z.txt", "z\n")], "unrelated");
+        setup_git(&dir, &["switch", "-qf", "main"]);
+        setup_git(&dir, &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "agent"]);
+
+        let repo = Repo::open(&dir).unwrap();
+        let br = repo.branches().unwrap();
+        assert_eq!(br.head_name, "main");
+        assert_eq!(br.list.len(), 5);
+        let get = |name: &str| br.list.iter().find(|b| b.name == name).unwrap();
+        let main = get("main");
+        assert!(main.current && main.cmp.is_none() && main.worktree.is_none());
+        // feature forked before main's last commit: 1 ahead, 1 behind, and only
+        // its own changes count (m.txt from main is not part of the diff).
+        let Some(Ok(c)) = &get("feature").cmp else { panic!("feature: {:?}", get("feature").cmp) };
+        assert_eq!((c.ahead, c.behind), (1, 1));
+        assert_eq!(c.files.len(), 2);
+        assert_eq!(totals(&c.files), (6, 0));
+        // A branch already contained in HEAD has nothing ahead and no changes.
+        let Some(Ok(c)) = &get("old").cmp else { panic!("old: {:?}", get("old").cmp) };
+        assert_eq!((c.ahead, c.behind, c.files.len()), (0, 1, 0));
+        // An unrelated branch reports its own error without failing the rest.
+        assert!(matches!(&get("lonely").cmp, Some(Err(e)) if e.contains("no common history")));
+        // A branch checked out in another worktree is marked.
+        let agent = get("agent");
+        assert!(agent.worktree.is_some());
+        assert!(matches!(&agent.cmp, Some(Ok(c)) if c.ahead == 0 && c.behind == 0));
+
+        // The second load comes from the (HEAD, tip) cache; errors are not cached.
+        assert_eq!(repo.branch_cache.lock().unwrap().len(), 3);
+        let again = repo.branches().unwrap();
+        let cmps = |b: &Branches| b.list.iter().map(|x| (x.name.clone(), x.cmp.clone())).collect::<Vec<_>>();
+        let (mut first, mut second) = (cmps(&br), cmps(&again));
+        first.sort_by(|a, b| a.0.cmp(&b.0));
+        second.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(first, second);
+
+        fs::remove_dir_all(&wt).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn untracked_line_count() {
         let dir = std::env::temp_dir().join(format!("diffdash-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -563,7 +800,7 @@ mod tests {
     fn untracked_cache_invalidates_on_change() {
         let dir = std::env::temp_dir().join(format!("diffdash-cache-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let repo = Repo { root: dir.clone(), untracked_cache: Mutex::new(HashMap::new()) };
+        let repo = Repo::at(dir.clone());
         fs::write(dir.join("a.txt"), "1\n2\n3\n").unwrap();
         let first = repo.untracked_stats(vec!["a.txt".into()]);
         assert_eq!(first[0].added, Some(3));
