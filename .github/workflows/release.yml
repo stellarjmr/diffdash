@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  macos-arm64:
+    name: Build macOS Apple Silicon binary
+    runs-on: macos-14
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify Apple Silicon runner
+        run: |
+          test "$(uname -s)" = "Darwin"
+          test "$(uname -m)" = "arm64"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          archive="diffdash-v${version}-macos-arm64.tar.gz"
+          staging="dist/diffdash-v${version}-macos-arm64"
+
+          mkdir -p "$staging"
+          cp target/release/diffdash "$staging/diffdash"
+          cp README.md CHANGELOG.md LICENSE "$staging/"
+
+          tar -czf "dist/${archive}" -C dist "diffdash-v${version}-macos-arm64"
+          shasum -a 256 "dist/${archive}" | tee "dist/${archive}.sha256"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes
+          fi

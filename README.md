@@ -12,7 +12,21 @@ diffdash never stages, commits, or writes to the repository. It shells out to yo
 | **2 Log** | Commit graph with files changed and `+/-` per commit; the lower pane lists the selected commit's files, largest change first. |
 | **3 Stats** | Commits and `+/-` totals for the last 7 / 30 / 90 days or all history, broken down by day, top-level directory and author. |
 
-## Install
+## Requirements
+
+- macOS on Apple Silicon for the prebuilt Homebrew package.
+- `git` on your `PATH`. diffdash runs it for every view.
+
+## Install with Homebrew
+
+```bash
+brew tap stellarjmr/tool
+brew install stellarjmr/tool/diffdash
+```
+
+The formula installs a prebuilt macOS Apple Silicon binary from GitHub Releases. It does not build from source and does not require Rust.
+
+## Build from source
 
 ```bash
 cargo install --path .
