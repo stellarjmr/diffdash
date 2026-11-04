@@ -19,7 +19,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Cell, Padding, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
-use git::{Branch, Branches, Bucket, Commit, FileStat, GraphRow, Log, Repo, Stats, WorkTree, totals};
+use git::{Branch, BranchCmp, Branches, Bucket, Commit, FileStat, GraphRow, Log, Repo, Stats, WorkTree, totals};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const REFRESH: Duration = Duration::from_secs(2);
@@ -41,7 +41,7 @@ const BRANCH_MARK: usize = 3;
 const NAME_FLOOR: usize = 16;
 /// Top bar: cells between the repo and branch names.
 const TOP_GAP: usize = 2;
-/// Top bar: a name cut shorter than this says too little.
+/// A name cut shorter than this says too little.
 const NAME_MIN: usize = 6;
 /// Stats: what the key column takes at least while there is room to spare, for
 /// days and for names (directories and authors).
@@ -908,14 +908,7 @@ impl App {
         };
         let max = w.staged.iter().chain(&w.unstaged).chain(&w.untracked).map(churn).max().unwrap_or(0);
         let (n, ta, td) = w.headline();
-        let title = Line::from(vec![
-            Span::raw(format!(" Changes since HEAD · {n} files  ")),
-            Span::styled(plus(ta), Style::new().fg(ADD).bold()),
-            Span::raw(" "),
-            Span::styled(minus(td), Style::new().fg(DEL).bold()),
-            Span::raw(" "),
-        ]);
-        let block = panel().title(title);
+        let block = panel().title(changes_title(n, ta, td, area.width));
         if self.work_rows.is_empty() {
             f.render_widget(message("working tree clean", DIM, block), area);
             return;
@@ -956,7 +949,8 @@ impl App {
             return;
         };
         let [top, bottom] = Layout::vertical([Constraint::Percentage(62), Constraint::Fill(1)]).areas(area);
-        let title = format!(" Log · latest {} commits ", log.commits.len());
+        let title = Line::from(format!(" Log · latest {} commits ", log.commits.len()));
+        let title = first_fit(top.width, vec![title, Line::from(" Log ")]);
         let table = log_table(log, top.width).block(panel().title(title));
         f.render_stateful_widget(table, top, &mut self.log_state);
 
@@ -965,16 +959,7 @@ impl App {
             f.render_widget(block, bottom);
             return;
         };
-        let (a, d) = totals(&c.files);
-        let title = Line::from(vec![
-            Span::styled(format!(" {} ", c.short), Style::new().fg(Color::Yellow)),
-            Span::raw(format!("{} · {} · {} files  ", c.author, c.date, c.files.len())),
-            Span::styled(plus(a), Style::new().fg(ADD).bold()),
-            Span::raw(" "),
-            Span::styled(minus(d), Style::new().fg(DEL).bold()),
-            Span::raw(" "),
-        ]);
-        let block = block.title(title);
+        let block = block.title(commit_title(c, bottom.width));
         if c.merge {
             let msg = "merge commit: git log reports no per-file stats for merges (Enter shows the commit)";
             f.render_widget(message(msg, DIM, block), bottom);
@@ -996,7 +981,7 @@ impl App {
             f.render_widget(self.placeholder(BRANCHES), area);
             return;
         };
-        let title = format!(" Branches · {} local · compared with {} ", br.list.len(), br.head_name);
+        let title = branches_title(br.list.len(), &br.head_name, area.width);
         if br.list.is_empty() {
             f.render_widget(message("no branches yet", DIM, panel().title(title)), area);
             return;
@@ -1013,11 +998,11 @@ impl App {
         };
         let mut block = panel();
         if let Some(path) = &b.worktree {
-            // The note goes first so a long path is what gets cut off.
-            let note = format!(" uncommitted changes in its worktree are not counted · {} ", tilde(path));
-            block = block.title_bottom(Line::from(note).fg(DIM));
+            block = block.title_bottom(Line::from(worktree_note(&tilde(path), bottom.width)).fg(DIM));
         }
-        let name = Span::styled(format!(" {} ", b.name), Style::new().fg(Color::Magenta).bold());
+        // The list above keeps the end of a long name, so this keeps its start.
+        let room = (bottom.width as usize).saturating_sub(4);
+        let name = Span::styled(format!(" {} ", clip(&b.name, room)), Style::new().fg(Color::Magenta).bold());
         let c = match &b.cmp {
             Some(Ok(c)) => c,
             other => {
@@ -1030,27 +1015,13 @@ impl App {
                     Some(Err(e)) => ("", e.clone(), DEL),
                     _ => ("", "HEAD has no commits yet, so there is nothing to compare with".to_string(), DIM),
                 };
-                let block = block.title(Line::from(vec![name, Span::raw(title)]));
+                let title = vec![Line::from(vec![name.clone(), Span::raw(title)]), Line::from(name)];
+                let block = block.title(first_fit(bottom.width, title));
                 f.render_widget(message(text, color, block), bottom);
                 return;
             }
         };
-        let (a, d) = totals(&c.files);
-        let title = Line::from(vec![
-            name,
-            Span::raw(format!(
-                "· {} ahead, {} behind · merge base {} · {} files  ",
-                c.ahead,
-                c.behind,
-                &c.merge_base[..c.merge_base.len().min(7)],
-                c.files.len()
-            )),
-            Span::styled(plus(a), Style::new().fg(ADD).bold()),
-            Span::raw(" "),
-            Span::styled(minus(d), Style::new().fg(DEL).bold()),
-            Span::raw(" "),
-        ]);
-        let block = block.title(title);
+        let block = block.title(branch_title(name, c, bottom.width));
         if c.files.is_empty() {
             let msg = if c.ahead == 0 {
                 format!("every commit on this branch is already in {}", br.head_name)
@@ -1389,6 +1360,97 @@ fn first_fit(area_w: u16, mut lines: Vec<Line<'static>>) -> Line<'static> {
     lines.swap_remove(i)
 }
 
+/// `+added -deleted ` in a panel title.
+fn title_totals(added: u64, deleted: u64) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(plus(added), Style::new().fg(ADD).bold()),
+        Span::raw(" "),
+        Span::styled(minus(deleted), Style::new().fg(DEL).bold()),
+        Span::raw(" "),
+    ]
+}
+
+/// The title of the Changes panel. The counts are its headline, so they go last.
+fn changes_title(n: usize, added: u64, deleted: u64, area_w: u16) -> Line<'static> {
+    let with_totals = |lead: String| Line::from([vec![Span::raw(lead)], title_totals(added, deleted)].concat());
+    first_fit(
+        area_w,
+        vec![
+            with_totals(format!(" Changes since HEAD · {n} files  ")),
+            with_totals(format!(" Changes · {n} files  ")),
+            with_totals(" Changes  ".to_string()),
+            Line::from(" Changes "),
+        ],
+    )
+}
+
+/// The title of the pane below the commit list. It is where hash, author and date
+/// stay visible when the list hides them, so the counts go first: the selected row
+/// shows them too. A long author is cut before a date is.
+fn commit_title(c: &Commit, area_w: u16) -> Line<'static> {
+    let (a, d) = totals(&c.files);
+    let hash = Span::styled(format!(" {} ", c.short), Style::new().fg(Color::Yellow));
+    let details = Span::raw(format!("{} · {} · {} files  ", c.author, c.date, c.files.len()));
+    let full = [vec![hash.clone(), details], title_totals(a, d)].concat();
+    let date = format!(" · {} ", c.date);
+    let room = (area_w as usize).saturating_sub(2 + hash.width() + cells(&date));
+    let dated = if room >= NAME_MIN.min(cells(&c.author)) {
+        format!("{}{date}", clip(&c.author, room))
+    } else {
+        format!("{} ", c.date)
+    };
+    first_fit(area_w, vec![Line::from(full), Line::from(vec![hash.clone(), Span::raw(dated)]), Line::from(hash)])
+}
+
+/// The title of the Branches list. The other branch names are in the list, and the
+/// one everything is compared with goes last.
+fn branches_title(n: usize, head: &str, area_w: u16) -> Line<'static> {
+    first_fit(
+        area_w,
+        vec![
+            Line::from(format!(" Branches · {n} local · compared with {head} ")),
+            Line::from(format!(" Branches · compared with {head} ")),
+            Line::from(format!(" Branches · {n} local ")),
+            Line::from(" Branches "),
+        ],
+    )
+}
+
+/// The title of a branch's pane, after its `name`. The merge base goes first, as
+/// nothing else depends on it, then files and lines, which the list shows too.
+fn branch_title(name: Span<'static>, c: &BranchCmp, area_w: u16) -> Line<'static> {
+    let (a, d) = totals(&c.files);
+    let counts = Span::raw(format!("· {} ahead, {} behind ", c.ahead, c.behind));
+    let counts = vec![name.clone(), counts];
+    let base = Span::raw(format!("· merge base {} ", &c.merge_base[..c.merge_base.len().min(7)]));
+    let files = [vec![Span::raw(format!("· {} files  ", c.files.len()))], title_totals(a, d)].concat();
+    first_fit(
+        area_w,
+        vec![
+            Line::from([counts.clone(), vec![base], files.clone()].concat()),
+            Line::from([counts.clone(), files].concat()),
+            Line::from(counts),
+            Line::from(name),
+        ],
+    )
+}
+
+/// What the bottom title of a branch's pane says about its worktree. The note comes
+/// first, and the path gets what is left, cut from the left like any path.
+fn worktree_note(path: &str, area_w: u16) -> String {
+    const NOTE: &str = " uncommitted changes in its worktree are not counted";
+    let inner = (area_w as usize).saturating_sub(2);
+    // Beside the path: the note, its separator and the closing space.
+    let room = inner.saturating_sub(cells(NOTE) + cells(" · ") + 1);
+    if room >= NAME_MIN.min(cells(path)) {
+        format!("{NOTE} · {} ", shorten_path(path, room))
+    } else if cells(NOTE) < inner {
+        format!("{NOTE} ")
+    } else {
+        " uncommitted changes not counted ".to_string()
+    }
+}
+
 /// The box at the top of the Stats tab. Everything in it goes whole: the words
 /// before the range pills, then the note, then the net count.
 fn stats_head(s: &Stats, range: usize, area_w: u16) -> Paragraph<'static> {
@@ -1433,7 +1495,8 @@ fn draw_stats(f: &mut Frame, area: Rect, s: &Stats, range: usize, state: &mut Ta
     let days = bucket_table(&s.by_day, left.width, DAY_KEY, fit_day).block(boxed(" By day "));
     f.render_stateful_widget(days, left, state);
     let dirs = bucket_table(&s.by_dir, rtop.width, NAME_KEY, clip);
-    f.render_widget(dirs.block(boxed(" By top-level directory ")), rtop);
+    let title = first_fit(rtop.width, vec![Line::from(" By top-level directory "), Line::from(" By directory ")]);
+    f.render_widget(dirs.block(panel().title(title)), rtop);
     let authors = bucket_table(&s.by_author, rbot.width, NAME_KEY, clip);
     f.render_widget(authors.block(boxed(" By author ")), rbot);
 }
@@ -1603,7 +1666,6 @@ fn run_tui(repo: Arc<Repo>, o: &Opts) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use git::BranchCmp;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -2504,6 +2566,147 @@ mod tests {
                 draw_message(width, height, "陈志民陈志民");
                 draw_message(width, height, "");
             }
+        }
+    }
+
+    fn draw_title(width: u16, title: Line<'static>) -> String {
+        let mut t = Terminal::new(TestBackend::new(width, 3)).unwrap();
+        t.draw(|f| {
+            let area = f.area();
+            f.render_widget(panel().title(title), area);
+        })
+        .unwrap();
+        rows_of(&t).remove(0)
+    }
+
+    fn text_of(line: &Line) -> String {
+        line.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// The counts in a title are all there or not there at all. A cut would make
+    /// `+12` read like a whole count.
+    fn assert_counts_whole(row: &str, width: u16) {
+        let whole = row.contains("+123456") && row.contains("-78901");
+        let none = !row.contains('+') && !row.contains(" -");
+        assert!(whole || none, "width {width}: {row}");
+    }
+
+    fn big_commit(author: &str) -> Commit {
+        Commit { files: vec![stat("a.rs", 123456, 78901)], ..commit("f512c0e", "Subject", author, 0) }
+    }
+
+    fn big_cmp() -> BranchCmp {
+        BranchCmp { merge_base: "abcdef0123456".into(), ahead: 2, behind: 0, files: vec![stat("a.rs", 123456, 78901)] }
+    }
+
+    fn pane_name(name: &str) -> Span<'static> {
+        Span::raw(format!(" {name} "))
+    }
+
+    #[test]
+    fn changes_title_gives_up_words_before_counts() {
+        let wide = " Changes since HEAD · 12 files  +123456 -78901 ";
+        assert_eq!(text_of(&changes_title(12, 123456, 78901, 200)), wide);
+        for width in 11..=200u16 {
+            let row = draw_title(width, changes_title(12, 123456, 78901, width));
+            assert_counts_whole(&row, width);
+            assert!(row.contains(" Changes "), "width {width}: {row}");
+            assert_eq!(row.contains("since HEAD"), width >= 49, "width {width}: {row}");
+            assert_eq!(row.contains("12 files"), width >= 38, "width {width}: {row}");
+            assert_eq!(row.contains("+123456"), width >= 27, "width {width}: {row}");
+        }
+    }
+
+    #[test]
+    fn commit_title_gives_up_counts_then_author_before_the_date() {
+        let c = big_commit("Zhimin Chen");
+        let wide = " f512c0e Zhimin Chen · 2026-11-04 · 1 files  +123456 -78901 ";
+        assert_eq!(text_of(&commit_title(&c, 200)), wide);
+        for width in 11..=200u16 {
+            let row = draw_title(width, commit_title(&c, width));
+            assert_counts_whole(&row, width);
+            assert!(row.contains(" f512c0e "), "width {width}: {row}");
+            assert_eq!(row.contains("+123456"), width >= cells(wide) as u16 + 2, "width {width}: {row}");
+            // The date is whole or not there.
+            assert_eq!(row.contains("2026-11-04"), width >= 22, "width {width}: {row}");
+            assert!(!row.contains("2026") || row.contains("2026-11-04"), "width {width}: {row}");
+        }
+    }
+
+    #[test]
+    fn long_author_is_cut_to_keep_the_date_in_the_commit_title() {
+        let c = big_commit(LONG_AUTHOR);
+        assert_eq!(text_of(&commit_title(&c, 40)), " f512c0e Christopher Mo… · 2026-11-04 ");
+        // Too little room for a useful piece of the name.
+        assert_eq!(text_of(&commit_title(&c, 31)), " f512c0e Chris… · 2026-11-04 ");
+        assert_eq!(text_of(&commit_title(&c, 30)), " f512c0e 2026-11-04 ");
+        assert_eq!(text_of(&commit_title(&c, 21)), " f512c0e ");
+        // A short name needs no more than it takes.
+        assert_eq!(text_of(&commit_title(&big_commit("Bob"), 28)), " f512c0e Bob · 2026-11-04 ");
+    }
+
+    #[test]
+    fn branch_title_gives_up_merge_base_then_lines_then_ahead_and_behind() {
+        let wide = " feature/x · 2 ahead, 0 behind · merge base abcdef0 · 1 files  +123456 -78901 ";
+        let title = |width| branch_title(pane_name("feature/x"), &big_cmp(), width);
+        assert_eq!(text_of(&title(200)), wide);
+        for width in 13..=200u16 {
+            let row = draw_title(width, title(width));
+            assert_counts_whole(&row, width);
+            assert!(row.contains(" feature/x "), "width {width}: {row}");
+            assert_eq!(row.contains("merge base abcdef0"), width >= 80, "width {width}: {row}");
+            assert_eq!(row.contains("merge"), width >= 80, "width {width}: {row}");
+            assert_eq!(row.contains("1 files"), width >= 59, "width {width}: {row}");
+            assert_eq!(row.contains("2 ahead, 0 behind"), width >= 33, "width {width}: {row}");
+        }
+    }
+
+    #[test]
+    fn branches_title_keeps_what_the_list_is_compared_with() {
+        let wide = " Branches · 7 local · compared with main ";
+        assert_eq!(text_of(&branches_title(7, "main", 200)), wide);
+        for width in 12..=200u16 {
+            let row = draw_title(width, branches_title(7, "main", width));
+            assert!(row.contains(" Branches "), "width {width}: {row}");
+            assert_eq!(row.contains("compared with main"), width >= 33, "width {width}: {row}");
+            assert_eq!(row.contains("compared"), width >= 33, "width {width}: {row}");
+            let local = width >= 43 || (22..33).contains(&width);
+            assert_eq!(row.contains("7 local"), local, "width {width}: {row}");
+            // A long name is whole or not there; `compared with agen` would mislead.
+            let row = draw_title(width, branches_title(7, LONG_BRANCH, width));
+            assert_eq!(row.contains("compared with"), row.contains(LONG_BRANCH), "width {width}: {row}");
+        }
+    }
+
+    #[test]
+    fn worktree_note_keeps_the_note_and_the_end_of_the_path() {
+        let path = "~/code/worktrees/agent";
+        let note = " uncommitted changes in its worktree are not counted";
+        assert_eq!(worktree_note(path, 200), format!("{note} · {path} "));
+        assert_eq!(worktree_note(path, 70), format!("{note} · …/agent "));
+        assert_eq!(worktree_note(path, 64), format!("{note} · agent "));
+        assert_eq!(worktree_note(path, 63), format!("{note} "));
+        assert_eq!(worktree_note(path, 55), format!("{note} "));
+        assert_eq!(worktree_note(path, 54), " uncommitted changes not counted ");
+        for width in 35..=120 {
+            assert!(cells(&worktree_note(path, width)) <= width as usize - 2, "width {width}");
+        }
+    }
+
+    #[test]
+    fn directory_title_gets_shorter_in_a_narrow_stats_pane() {
+        for (width, long) in [(52u16, true), (50, false)] {
+            let mut t = Terminal::new(TestBackend::new(width, 12)).unwrap();
+            let mut state = TableState::default();
+            let s = sample_stats();
+            t.draw(|f| {
+                let area = f.area();
+                draw_stats(f, area, &s, 1, &mut state);
+            })
+            .unwrap();
+            let row = &rows_of(&t)[3];
+            assert_eq!(row.contains("By top-level directory"), long, "width {width}: {row}");
+            assert_eq!(row.contains("By directory"), !long, "width {width}: {row}");
         }
     }
 
