@@ -39,6 +39,14 @@ const BRANCH_MARK: usize = 3;
 /// Branch list: below this many cells of name, marker included, the counts other
 /// than `+` and `-` go too.
 const NAME_FLOOR: usize = 16;
+/// Stats: what the key column takes at least while there is room to spare, for
+/// days and for names (directories and authors).
+const DAY_KEY: usize = 11;
+const NAME_KEY: usize = 18;
+/// Stats: commit column while there is room to spare.
+const COUNT_W: usize = 5;
+/// Stats: cells of bar worth keeping the padding of the number columns for.
+const BUCKET_BAR: usize = 4;
 const RANGES: [(&str, Option<u32>); 4] =
     [("7d", Some(7)), ("30d", Some(30)), ("90d", Some(90)), ("all", None)];
 // New tabs go at the end so existing number keys keep their meaning.
@@ -922,42 +930,7 @@ impl App {
             f.render_widget(self.placeholder(STATS), area);
             return;
         };
-        let (rname, _) = RANGES[self.range];
-        let mut title = vec![Span::raw(" Stats · range ")];
-        for (i, (n, _)) in RANGES.iter().enumerate() {
-            let label = format!(" {n} ");
-            if i == self.range {
-                title.extend(pill(label, Some(ACCENT)));
-            } else {
-                title.extend(pill_slot(label, Style::new().fg(DIM)));
-            }
-        }
-        title.push(Span::raw(" "));
-        let [head, body] = Layout::vertical([Constraint::Length(3), Constraint::Fill(1)]).areas(area);
-        let net = s.added as i64 - s.deleted as i64;
-        let summary = vec![
-            Span::raw(" "),
-            Span::styled(format!("{} commits", s.commits), Style::new().bold()),
-            Span::raw("   "),
-            Span::styled(plus(s.added), Style::new().fg(ADD).bold()),
-            Span::raw("  "),
-            Span::styled(minus(s.deleted), Style::new().fg(DEL).bold()),
-            Span::raw("   net "),
-            Span::styled(format!("{net:+}"), Style::new().bold()),
-            Span::styled(format!("   ({rname}, merges excluded)"), Style::new().fg(DIM)),
-        ];
-        f.render_widget(
-            Paragraph::new(Line::from(summary))
-                .block(panel().title(Line::from(title))),
-            head,
-        );
-        let [left, right] = Layout::horizontal([Constraint::Percentage(50), Constraint::Fill(1)]).areas(body);
-        let [rtop, rbot] = Layout::vertical([Constraint::Percentage(55), Constraint::Fill(1)]).areas(right);
-        let boxed = |t: &'static str| panel().title(t);
-        let days = bucket_table(&s.by_day, 11, left).block(boxed(" By day "));
-        f.render_stateful_widget(days, left, &mut self.stats_state);
-        f.render_widget(bucket_table(&s.by_dir, 18, rtop).block(boxed(" By top-level directory ")), rtop);
-        f.render_widget(bucket_table(&s.by_author, 18, rbot).block(boxed(" By author ")), rbot);
+        draw_stats(f, area, s, self.range, &mut self.stats_state);
     }
 
     fn render_branches(&mut self, f: &mut Frame, area: Rect) {
@@ -1350,35 +1323,149 @@ fn log_table(log: &Log, area_w: u16) -> Table<'static> {
     shown_table(rows, &cols.widths)
 }
 
-/// Table of buckets whose bars are scaled to the space left in `area`, so a
-/// narrow pane shrinks every bar instead of clipping only the longest ones.
-fn bucket_table(list: &[Bucket], key_width: u16, area: Rect) -> Table<'static> {
-    const COUNT_W: u16 = 5;
-    const NUM_W: u16 = 8;
-    // borders (2) + four column gaps (4) + one cell of right margin.
-    let used = 2 + key_width + COUNT_W + 2 * NUM_W + 4 + 1;
-    let bar_w = area.width.saturating_sub(used).max(1) as usize;
+/// The first of these lines that fits in a panel `area_w` wide. A line the panel
+/// clips can end in the middle of a number, and `net +12` reads like a whole count.
+fn first_fit(area_w: u16, mut lines: Vec<Line<'static>>) -> Line<'static> {
+    let inner = (area_w as usize).saturating_sub(2);
+    let i = lines.iter().position(|l| l.width() <= inner).unwrap_or(lines.len() - 1);
+    lines.swap_remove(i)
+}
+
+/// The box at the top of the Stats tab. Everything in it goes whole: the words
+/// before the range pills, then the note, then the net count.
+fn stats_head(s: &Stats, range: usize, area_w: u16) -> Paragraph<'static> {
+    let mut pills = Vec::new();
+    for (i, (n, _)) in RANGES.iter().enumerate() {
+        let label = format!(" {n} ");
+        if i == range {
+            pills.extend(pill(label, Some(ACCENT)));
+        } else {
+            pills.extend(pill_slot(label, Style::new().fg(DIM)));
+        }
+    }
+    pills.push(Span::raw(" "));
+    let title = |lead: &'static str| Line::from([vec![Span::raw(lead)], pills.clone()].concat());
+    let title = first_fit(area_w, vec![title(" Stats · range "), title(" Stats "), title(" ")]);
+
+    let totals = vec![
+        Span::raw(" "),
+        Span::styled(format!("{} commits", s.commits), Style::new().bold()),
+        Span::raw("   "),
+        Span::styled(plus(s.added), Style::new().fg(ADD).bold()),
+        Span::raw("  "),
+        Span::styled(minus(s.deleted), Style::new().fg(DEL).bold()),
+    ];
+    let net = s.added as i64 - s.deleted as i64;
+    let net = vec![Span::raw("   net "), Span::styled(format!("{net:+}"), Style::new().bold())];
+    let note = Span::styled(format!("   ({}, merges excluded)", RANGES[range].0), Style::new().fg(DIM));
+    let with_net = [totals.clone(), net].concat();
+    let summary = first_fit(
+        area_w,
+        vec![Line::from([with_net.clone(), vec![note]].concat()), Line::from(with_net), Line::from(totals)],
+    );
+    Paragraph::new(summary).block(panel().title(title))
+}
+
+fn draw_stats(f: &mut Frame, area: Rect, s: &Stats, range: usize, state: &mut TableState) {
+    let [head, body] = Layout::vertical([Constraint::Length(3), Constraint::Fill(1)]).areas(area);
+    f.render_widget(stats_head(s, range, area.width), head);
+    let [left, right] = Layout::horizontal([Constraint::Percentage(50), Constraint::Fill(1)]).areas(body);
+    let [rtop, rbot] = Layout::vertical([Constraint::Percentage(55), Constraint::Fill(1)]).areas(right);
+    let boxed = |t: &'static str| panel().title(t);
+    let days = bucket_table(&s.by_day, left.width, DAY_KEY, fit_day).block(boxed(" By day "));
+    f.render_stateful_widget(days, left, state);
+    let dirs = bucket_table(&s.by_dir, rtop.width, NAME_KEY, clip);
+    f.render_widget(dirs.block(boxed(" By top-level directory ")), rtop);
+    let authors = bucket_table(&s.by_author, rbot.width, NAME_KEY, clip);
+    f.render_widget(authors.block(boxed(" By author ")), rbot);
+}
+
+/// A day that does not fit loses its year first: `11-01`.
+fn fit_day(day: &str, width: usize) -> String {
+    if cells(day) <= width {
+        return day.to_string();
+    }
+    clip(day.get(5..).unwrap_or(day), width)
+}
+
+/// `s` in at most `width` cells, cut on the right. The start of an author or a
+/// top-level directory says the most.
+fn clip(s: &str, width: usize) -> String {
+    if cells(s) <= width {
+        return s.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut used = cells("…");
+    let mut end = 0;
+    for (i, c) in s.char_indices() {
+        used += cells(c.encode_utf8(&mut [0; 4]));
+        if used > width {
+            break;
+        }
+        end = i + c.len_utf8();
+    }
+    format!("{}…", &s[..end])
+}
+
+fn commits(b: &Bucket) -> String {
+    format!("{}c", b.commits)
+}
+
+/// Column widths of a Stats table: key with its leading space, commits, added,
+/// deleted, and the bar with one cell of margin. A narrow pane loses the padding
+/// of the number columns, then the bar, then the commit count, and only then key
+/// text. `roomy_key` keeps the key column of a roomy table from moving with its
+/// data, and a key longer than that takes what it needs from the bar.
+fn bucket_cols(area_w: u16, list: &[Bucket], roomy_key: usize) -> [usize; 5] {
+    let (mut key, mut count, mut add, mut del) = (0, 0, 0, 0);
+    for b in list {
+        key = key.max(1 + cells(&b.key));
+        count = count.max(commits(b).len());
+        add = add.max(plus(b.added).len());
+        del = del.max(minus(b.deleted).len());
+    }
+    let key = key.min(NAME_GOAL);
+    let inner = (area_w as usize).saturating_sub(2);
+    let roomy = [key.max(roomy_key), count.max(COUNT_W), add.max(NUM_W), del.max(NUM_W)];
+    let [key, count, add, del] = if room_beside(inner, &roomy) > BUCKET_BAR {
+        roomy
+    } else if room_beside(inner, &[count, add, del]) >= key.min(DAY_KEY) {
+        [key, count, add, del]
+    } else {
+        // Room for a full date is worth more than the commit count.
+        [key, 0, add, del]
+    };
+    let beside = room_beside(inner, &[count, add, del]);
+    let key = key.min(beside);
+    // A bar never shows in place of the commit count, and its margin needs a bar
+    // to follow.
+    let bar = room_beside(beside, &[key]);
+    [key, count, add, del, if count > 0 && bar > 1 { bar } else { 0 }]
+}
+
+/// `fit` puts a key in the room of its column.
+fn bucket_table(list: &[Bucket], area_w: u16, roomy_key: usize, fit: fn(&str, usize) -> String) -> Table<'static> {
+    let widths = bucket_cols(area_w, list, roomy_key);
+    let [key, _, _, _, bar] = widths;
     let max = list.iter().map(|b| b.added + b.deleted).max().unwrap_or(0);
     let rows: Vec<Row> = list
         .iter()
         .map(|b| {
-            Row::new(vec![
-                Cell::from(format!(" {}", b.key)),
-                Cell::from(Line::from(format!("{}c", b.commits)).right_aligned().fg(DIM)),
-                Cell::from(Line::from(plus(b.added)).right_aligned().fg(ADD)),
-                Cell::from(Line::from(minus(b.deleted)).right_aligned().fg(DEL)),
-                Cell::from(bar_line(b.added, b.deleted, max, bar_w)),
-            ])
+            Row::new(shown(
+                &widths,
+                [
+                    Cell::from(format!(" {}", fit(&b.key, key.saturating_sub(1)))),
+                    Cell::from(Line::from(commits(b)).right_aligned().fg(DIM)),
+                    Cell::from(Line::from(plus(b.added)).right_aligned().fg(ADD)),
+                    Cell::from(Line::from(minus(b.deleted)).right_aligned().fg(DEL)),
+                    Cell::from(bar_line(b.added, b.deleted, max, bar.saturating_sub(1))),
+                ],
+            ))
         })
         .collect();
-    let widths = [
-        Constraint::Length(key_width),
-        Constraint::Length(COUNT_W),
-        Constraint::Length(NUM_W),
-        Constraint::Length(NUM_W),
-        Constraint::Fill(1),
-    ];
-    Table::new(rows, widths).row_highlight_style(selected_style())
+    shown_table(rows, &widths)
 }
 
 /// Move a table selection by `delta`, landing only on rows where `ok(i)`.
@@ -1961,6 +2048,230 @@ mod tests {
         for width in 1..30 {
             draw_table(width, 4, branch_table(&sample_branches(), width));
             draw_table(width, 4, branch_table(&[], width));
+        }
+    }
+
+    fn bucket(key: &str, commits: u64, added: u64, deleted: u64) -> Bucket {
+        Bucket { key: key.into(), added, deleted, commits }
+    }
+
+    const LONG_AUTHOR: &str = "Christopher Montgomery-Smithson";
+
+    /// Holds a huge count, so a narrow pane cannot make room by tightening alone.
+    fn sample_days() -> Vec<Bucket> {
+        vec![bucket("2026-11-01", 1, 3, 0), bucket("2026-09-01", 12, 123456, 0), bucket("2024-03-01", 1, 50, 7)]
+    }
+
+    fn sample_authors() -> Vec<Bucket> {
+        vec![bucket(LONG_AUTHOR, 1, 123456, 0), bucket("Zhimin Chen", 12, 58, 7)]
+    }
+
+    fn short_days() -> Vec<Bucket> {
+        vec![bucket("2026-11-01", 1, 3, 0), bucket("2026-10-20", 1, 7, 0)]
+    }
+
+    fn short_names() -> Vec<Bucket> {
+        vec![bucket("src/", 1, 7, 0), bucket("(root)", 1, 3, 0)]
+    }
+
+    fn sample_stats() -> Stats {
+        Stats {
+            commits: 14,
+            added: 123509,
+            deleted: 7,
+            by_day: sample_days(),
+            by_dir: short_names(),
+            by_author: sample_authors(),
+        }
+    }
+
+    fn rows_of(t: &Terminal<TestBackend>) -> Vec<String> {
+        let b = t.backend().buffer();
+        (0..b.area.height).map(|y| (0..b.area.width).map(|x| b[(x, y)].symbol()).collect()).collect()
+    }
+
+    fn draw_head(width: u16, s: &Stats, range: usize) -> Vec<String> {
+        let mut t = Terminal::new(TestBackend::new(width, 3)).unwrap();
+        t.draw(|f| {
+            let area = f.area();
+            f.render_widget(stats_head(s, range, width), area);
+        })
+        .unwrap();
+        rows_of(&t)
+    }
+
+    #[test]
+    fn stats_tables_keep_their_old_layout_while_the_bar_has_room() {
+        // The old columns: key, 5, 8, 8 and the rest, with four gaps between them.
+        for width in [43, 46, 60, 120] {
+            let rest = width as usize - 2 - 11 - 5 - 16 - 4;
+            assert_eq!(bucket_cols(width, &short_days(), DAY_KEY), [11, 5, 8, 8, rest], "width {width}");
+        }
+        for width in [50, 60, 120] {
+            let rest = width as usize - 2 - 18 - 5 - 16 - 4;
+            assert_eq!(bucket_cols(width, &short_names(), NAME_KEY), [18, 5, 8, 8, rest], "width {width}");
+        }
+    }
+
+    #[test]
+    fn stats_tables_give_up_padding_then_bar_then_commits_then_key() {
+        let days = sample_days();
+        assert_eq!(bucket_cols(43, &days, DAY_KEY), [11, 5, 8, 8, 5]);
+        // The padding goes first, which makes the bar longer.
+        assert_eq!(bucket_cols(42, &days, DAY_KEY), [11, 3, 7, 2, 13]);
+        // The bar is gone when it would have only its margin.
+        assert_eq!(bucket_cols(31, &days, DAY_KEY), [11, 3, 7, 2, 2]);
+        assert_eq!(bucket_cols(30, &days, DAY_KEY), [11, 3, 7, 2, 0]);
+        // The commit count stays for as long as a whole date fits beside it.
+        assert_eq!(bucket_cols(28, &days, DAY_KEY), [11, 3, 7, 2, 0]);
+        assert_eq!(bucket_cols(27, &days, DAY_KEY), [11, 0, 7, 2, 0]);
+        // Then the key gets shorter. Added and deleted are never cut.
+        assert_eq!(bucket_cols(23, &days, DAY_KEY), [10, 0, 7, 2, 0]);
+        assert_eq!(bucket_cols(20, &days, DAY_KEY), [7, 0, 7, 2, 0]);
+    }
+
+    #[test]
+    fn long_name_takes_room_from_the_bar_but_not_without_limit() {
+        let authors = sample_authors();
+        // It used to be cut at 18 cells at any width.
+        assert_eq!(bucket_cols(120, &authors, NAME_KEY), [32, 5, 8, 8, 61]);
+        // Padding, then bar: the whole name still fits.
+        assert_eq!(bucket_cols(60, &authors, NAME_KEY), [32, 3, 7, 2, 10]);
+        assert_eq!(bucket_cols(49, &authors, NAME_KEY), [32, 3, 7, 2, 0]);
+        // Then the name is what gets shorter, until a whole date would not fit.
+        assert_eq!(bucket_cols(36, &authors, NAME_KEY), [19, 3, 7, 2, 0]);
+        assert_eq!(bucket_cols(28, &authors, NAME_KEY), [11, 3, 7, 2, 0]);
+        assert_eq!(bucket_cols(27, &authors, NAME_KEY), [14, 0, 7, 2, 0]);
+        // One very long name leaves the bar something.
+        let huge = [bucket(&"x".repeat(60), 1, 3, 0)];
+        assert_eq!(bucket_cols(120, &huge, NAME_KEY)[0], NAME_GOAL);
+    }
+
+    #[test]
+    fn stats_columns_add_up_to_the_pane_at_every_width() {
+        for width in 20..=200u16 {
+            let inner = width as usize - 2;
+            for (list, roomy) in
+                [(sample_days(), DAY_KEY), (sample_authors(), NAME_KEY), (short_days(), DAY_KEY), (short_names(), NAME_KEY)]
+            {
+                let widths = bucket_cols(width, &list, roomy);
+                let used: usize = widths.iter().filter(|w| **w > 0).map(|w| w + 1).sum::<usize>() - 1;
+                assert!(used <= inner, "width {width}: {widths:?} takes {used} of {inner}");
+            }
+        }
+    }
+
+    #[test]
+    fn days_and_counts_stay_readable_in_a_stats_table_at_every_width() {
+        for width in 20..=120u16 {
+            let screen = draw_table(width, 5, bucket_table(&sample_days(), width, DAY_KEY, fit_day));
+            for (row, day, year, add, del) in [
+                (&screen[1], "11-01", "2026-11-01", "+3", "-0"),
+                (&screen[2], "09-01", "2026-09-01", "+123456", "-0"),
+                (&screen[3], "03-01", "2024-03-01", "+50", "-7"),
+            ] {
+                // A day is never cut down to `…01`.
+                assert!(row.contains(day), "width {width}: {row}");
+                assert!(!row.contains('…'), "width {width}: {row}");
+                assert_eq!(row.contains(year), width >= 24, "width {width}: {row}");
+                assert!(row.contains(add) && row.contains(del), "width {width}: {row}");
+            }
+            assert_eq!(screen[2].contains("12c"), width >= 28, "width {width}: {}", screen[2]);
+        }
+    }
+
+    #[test]
+    fn names_are_cut_on_the_right_in_a_stats_table() {
+        for width in 20..=120u16 {
+            let screen = draw_table(width, 4, bucket_table(&sample_authors(), width, NAME_KEY, clip));
+            let (first, second) = (&screen[1], &screen[2]);
+            assert!(first.contains("Chris"), "width {width}: {first}");
+            assert!(second.contains("Zhimi"), "width {width}: {second}");
+            assert_eq!(first.contains(LONG_AUTHOR), width >= 49, "width {width}: {first}");
+            assert!(first.contains("+123456") && first.contains("-0"), "width {width}: {first}");
+            assert!(second.contains("+58") && second.contains("-7"), "width {width}: {second}");
+        }
+    }
+
+    #[test]
+    fn clip_keeps_the_start_and_counts_cells() {
+        assert_eq!(clip("Zhimin Chen", 11), "Zhimin Chen");
+        assert_eq!(clip("Zhimin Chen", 10), "Zhimin Ch…");
+        assert_eq!(clip("Zhimin Chen", 1), "…");
+        assert_eq!(clip("Zhimin Chen", 0), "");
+        assert_eq!(clip("陈志民", 6), "陈志民");
+        assert_eq!(clip("陈志民", 5), "陈志…");
+        assert_eq!(clip("陈志民", 4), "陈…");
+    }
+
+    #[test]
+    fn a_day_loses_its_year_first() {
+        assert_eq!(fit_day("2026-11-01", 10), "2026-11-01");
+        assert_eq!(fit_day("2026-11-01", 9), "11-01");
+        assert_eq!(fit_day("2026-11-01", 5), "11-01");
+        assert_eq!(fit_day("2026-11-01", 4), "11-…");
+    }
+
+    #[test]
+    fn stats_head_drops_things_whole_and_never_cuts_a_number() {
+        let s = Stats { commits: 6, added: 123641, deleted: 12, ..Default::default() };
+        for width in 31..=120u16 {
+            let screen = draw_head(width, &s, 3);
+            let (title, summary) = (&screen[0], &screen[1]);
+            // Every range pill stays, so the active one can always be seen.
+            for range in ["7d", "30d", "90d", "all"] {
+                assert!(title.contains(range), "width {width}: {title}");
+            }
+            assert_eq!(title.contains("Stats · range"), width >= 45, "width {width}: {title}");
+            assert_eq!(title.contains("Stats"), width >= 37, "width {width}: {title}");
+            assert!(summary.contains("6 commits"), "width {width}: {summary}");
+            assert!(summary.contains("+123641") && summary.contains("-12"), "width {width}: {summary}");
+            assert_eq!(summary.contains("net"), width >= 41, "width {width}: {summary}");
+            assert_eq!(summary.contains("net +123629"), width >= 41, "width {width}: {summary}");
+            assert_eq!(summary.contains('('), width >= 66, "width {width}: {summary}");
+            assert_eq!(summary.contains("(all, merges excluded)"), width >= 66, "width {width}: {summary}");
+        }
+    }
+
+    #[test]
+    fn selected_day_is_highlighted_across_its_pane() {
+        let s = sample_stats();
+        for width in [40u16, 50, 60, 80, 120] {
+            let mut t = Terminal::new(TestBackend::new(width, 14)).unwrap();
+            let mut state = TableState::default().with_selected(Some(1));
+            t.draw(|f| {
+                let area = f.area();
+                draw_stats(f, area, &s, 1, &mut state);
+            })
+            .unwrap();
+            let b = t.backend().buffer();
+            // Below the three rows of the head and the pane's top border.
+            for x in 1..width / 2 - 1 {
+                assert!(b[(x, 5)].modifier.contains(Modifier::REVERSED), "width {width}, x {x}");
+            }
+            assert!(!b[(1, 4)].modifier.contains(Modifier::REVERSED), "width {width}");
+        }
+    }
+
+    #[test]
+    fn tiny_stats_do_not_panic() {
+        let s = sample_stats();
+        for width in 1..60u16 {
+            for height in 1..12u16 {
+                let mut t = Terminal::new(TestBackend::new(width, height)).unwrap();
+                let mut state = TableState::default().with_selected(Some(0));
+                t.draw(|f| {
+                    let area = f.area();
+                    draw_stats(f, area, &s, 1, &mut state);
+                })
+                .unwrap();
+                let empty = Stats::default();
+                t.draw(|f| {
+                    let area = f.area();
+                    draw_stats(f, area, &empty, 1, &mut state);
+                })
+                .unwrap();
+            }
         }
     }
 }
