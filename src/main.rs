@@ -26,13 +26,19 @@ const REFRESH: Duration = Duration::from_secs(2);
 const BAR: usize = 24;
 /// Number columns of a file list when there is room to spare.
 const NUM_W: usize = 8;
-/// In a file list, names up to this wide win over the bar. A longer one is
-/// shortened instead, so one deep path cannot erase the bar of every row.
+/// What one long name can claim. In a file list it is the most a name takes from
+/// the bar, so one deep path cannot erase the bar of every row. In the branch list
+/// it is the most a name takes from the words in `1 ahead` and the date.
 const NAME_GOAL: usize = 40;
 /// Cells of subject the commit list keeps before it starts hiding columns.
 const SUBJECT_GOAL: usize = 24;
 const INDENT: &str = "  ";
 const NEW_TAG: &str = " new";
+/// Cells before a branch name: a space and the current-branch marker.
+const BRANCH_MARK: usize = 3;
+/// Branch list: below this many cells of name, marker included, the counts other
+/// than `+` and `-` go too.
+const NAME_FLOOR: usize = 16;
 const RANGES: [(&str, Option<u32>); 4] =
     [("7d", Some(7)), ("30d", Some(30)), ("90d", Some(90)), ("all", None)];
 // New tabs go at the end so existing number keys keep their meaning.
@@ -967,30 +973,7 @@ impl App {
         // Branch lists are usually short; the selected branch's files get the rest.
         let list_h = (br.list.len() as u16 + 2).min(area.height / 2).max(3);
         let [top, bottom] = Layout::vertical([Constraint::Length(list_h), Constraint::Fill(1)]).areas(area);
-        // Counts and date have fixed widths. The name column fits the longest
-        // name and the bar gets what is left, so a narrow terminal shrinks the
-        // bar instead of hiding branch names.
-        const FIXED: u16 = 9 + 11 + 5 + 7 + 7 + 14 + 7; // six columns, seven gaps
-        let names: Vec<Line<'static>> = br.list.iter().map(branch_name).collect();
-        let name_w = names.iter().map(Line::width).max().unwrap_or(0) as u16;
-        let room = area.width.saturating_sub(2 + FIXED);
-        let bar_col = room.saturating_sub(name_w).min(BAR as u16 + 1);
-        let bar_w = bar_col.saturating_sub(1) as usize;
-        let max = br.list.iter().map(branch_churn).max().unwrap_or(0);
-        let rows: Vec<Row> = br.list.iter().zip(names).map(|(b, name)| branch_row(b, name, max, bar_w)).collect();
-        let widths = [
-            Constraint::Fill(1),
-            Constraint::Length(9),
-            Constraint::Length(11),
-            Constraint::Length(5),
-            Constraint::Length(7),
-            Constraint::Length(7),
-            Constraint::Length(bar_col),
-            Constraint::Length(14),
-        ];
-        let table = Table::new(rows, widths)
-            .block(panel().title(title))
-            .row_highlight_style(selected_style());
+        let table = branch_table(&br.list, top.width).block(panel().title(title));
         f.render_stateful_widget(table, top, &mut self.branch_state);
 
         let Some(b) = self.selected_branch() else {
@@ -1060,46 +1043,127 @@ fn branch_churn(b: &Branch) -> u64 {
     }
 }
 
-/// Name cell of a branch row: current-branch marker, name and dim tags.
-fn branch_name(b: &Branch) -> Line<'static> {
+/// Name cell of a branch row in `width` cells: current-branch marker, name and
+/// dim tags. The tags go before any of the name, since the pane below says the
+/// same for the selected branch.
+fn branch_name(b: &Branch, width: usize) -> Line<'static> {
     let (mark, style) = if b.current {
         ("* ", Style::new().fg(Color::Magenta).bold())
     } else {
         ("  ", Style::new())
     };
-    let mut spans = vec![Span::raw(format!(" {mark}")), Span::styled(b.name.clone(), style)];
+    let mut tags = Vec::new();
     if b.worktree.is_some() {
-        spans.push(Span::styled(" worktree", Style::new().fg(DIM)));
+        tags.push(Span::styled(" worktree", Style::new().fg(DIM)));
     }
     if let Some(Err(_)) = &b.cmp {
-        spans.push(Span::styled("  no common history", Style::new().fg(DIM)));
+        tags.push(Span::styled("  no common history", Style::new().fg(DIM)));
     }
+    let room = width.saturating_sub(BRANCH_MARK);
+    let tags_w: usize = tags.iter().map(Span::width).sum();
+    if cells(&b.name) + tags_w > room {
+        tags.clear();
+    }
+    let mut spans = vec![Span::raw(format!(" {mark}")), Span::styled(shorten_path(&b.name, room), style)];
+    spans.extend(tags);
     Line::from(spans)
 }
 
-fn branch_row(b: &Branch, name: Line<'static>, max: u64, bar_w: usize) -> Row<'static> {
-    let mut cells = vec![Cell::from(name)];
+/// Column widths of the branch list: name, ahead, behind, files, added, deleted,
+/// bar plus one cell of margin, date. `words` spells out `1 ahead`, otherwise
+/// the two counts are `↑1` and `↓0`.
+struct BranchCols {
+    words: bool,
+    widths: [usize; 8],
+}
+
+/// Fits the branch list into a panel `area_w` cells wide. While names and a whole
+/// bar fit, the columns have their full widths. Below that, the padding goes
+/// first and the bar takes what the names leave. Then the words in `1 ahead` go,
+/// and the date. Only then are names shortened, since they say which branch a row
+/// is; a name kept from `NAME_FLOOR` also hides the counts other than `+` and `-`.
+fn branch_cols(area_w: u16, list: &[Branch]) -> BranchCols {
+    // Name alone and name with its tags; only the name can hide a column.
+    let (mut name, mut full, mut date) = (0, 0, 0);
+    let (mut ahead, mut behind) = (1, 1);
+    // Three cells keep small counts from shifting the columns.
+    let (mut files, mut add, mut del) = (3, 3, 3);
+    for b in list {
+        name = name.max(BRANCH_MARK + cells(&b.name));
+        full = full.max(branch_name(b, usize::MAX).width());
+        date = date.max(cells(&b.rel_date));
+        if let Some(Ok(c)) = &b.cmp {
+            let (a, d) = totals(&c.files);
+            ahead = ahead.max(c.ahead.to_string().len());
+            behind = behind.max(c.behind.to_string().len());
+            files = files.max(format!("{}f", c.files.len()).len());
+            add = add.max(plus(a).len());
+            del = del.max(minus(d).len());
+        }
+    }
+    let date = date.min(14);
+    let inner = (area_w as usize).saturating_sub(2);
+    let (ahead_w, behind_w) = (ahead + " ahead".len(), behind + " behind".len());
+    // Ahead, behind, files, added, deleted, date.
+    let roomy = [ahead_w.max(9), behind_w.max(11), files.max(5), add.max(7), del.max(7), 14];
+    let goal = name.min(NAME_GOAL);
+    // Spelled out, what a layout must leave for names, and its columns.
+    let layouts = [
+        (true, goal, [ahead_w, behind_w, files, add, del, date]),
+        (false, goal, [ahead + 1, behind + 1, files, add, del, date]),
+        (false, name.min(NAME_FLOOR), [ahead + 1, behind + 1, files, add, del, 0]),
+        (false, 0, [0, 0, 0, add, del, 0]),
+    ];
+    // The whole bar is 24 cells, a cell of margin and a gap.
+    let (words, others) = if room_beside(inner, &roomy) >= full + BAR + 2 {
+        (true, roomy)
+    } else {
+        let (words, _, others) = layouts
+            .into_iter()
+            .find(|(_, goal, others)| room_beside(inner, others) >= *goal)
+            .unwrap_or(layouts[3]);
+        (words, others)
+    };
+    let room = room_beside(inner, &others);
+    // A bar gets what names with their tags leave, but not in place of the counts.
+    let bar = if others[0] > 0 { room.saturating_sub(full + 2).min(BAR) } else { 0 };
+    let bar_col = if bar > 0 { bar + 1 } else { 0 };
+    let [ahead, behind, files, add, del, date] = others;
+    BranchCols { words, widths: [room_beside(room, &[bar_col]), ahead, behind, files, add, del, bar_col, date] }
+}
+
+fn branch_row(b: &Branch, cols: &BranchCols, max: u64) -> Row<'static> {
+    let [name_w, .., bar_col, _] = cols.widths;
+    let mut row = vec![Cell::from(branch_name(b, name_w))];
     match &b.cmp {
         Some(Ok(c)) => {
             let (a, d) = totals(&c.files);
             // Zero counts are dimmed so branches with work stand out.
-            let count = |n: u64, what: &str| {
-                let line = Line::from(format!("{n} {what}")).right_aligned();
+            let count = |n: u64, word: &str, arrow: &str| {
+                let text = if cols.words { format!("{n} {word}") } else { format!("{arrow}{n}") };
+                let line = Line::from(text).right_aligned();
                 Cell::from(if n == 0 { line.fg(DIM) } else { line })
             };
-            cells.extend([
-                count(c.ahead, "ahead"),
-                count(c.behind, "behind"),
+            row.extend([
+                count(c.ahead, "ahead", "↑"),
+                count(c.behind, "behind", "↓"),
                 Cell::from(Line::from(format!("{}f", c.files.len())).right_aligned().fg(DIM)),
                 Cell::from(Line::from(plus(a)).right_aligned().fg(ADD)),
                 Cell::from(Line::from(minus(d)).right_aligned().fg(DEL)),
-                Cell::from(bar_line(a, d, max, bar_w)),
+                Cell::from(bar_line(a, d, max, bar_col.saturating_sub(1))),
             ]);
         }
-        _ => cells.extend((0..6).map(|_| Cell::from(""))),
+        _ => row.extend((0..6).map(|_| Cell::from(""))),
     }
-    cells.push(Cell::from(Line::from(b.rel_date.clone()).fg(DIM)));
-    Row::new(cells)
+    row.push(Cell::from(Line::from(b.rel_date.clone()).fg(DIM)));
+    Row::new(shown(&cols.widths, row))
+}
+
+fn branch_table(list: &[Branch], area_w: u16) -> Table<'static> {
+    let cols = branch_cols(area_w, list);
+    let max = list.iter().map(branch_churn).max().unwrap_or(0);
+    let rows: Vec<Row> = list.iter().map(|b| branch_row(b, &cols, max)).collect();
+    shown_table(rows, &cols.widths)
 }
 
 /// `path` with the home directory shown as `~`.
@@ -1394,6 +1458,7 @@ fn run_tui(repo: Arc<Repo>, o: &Opts) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git::BranchCmp;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -1702,6 +1767,200 @@ mod tests {
         for width in 1..30 {
             draw_table(width, 5, log_table(&sample_log(), width));
             draw_table(width, 5, log_table(&Log::default(), width));
+        }
+    }
+
+    fn branch(name: &str, ahead: u64, behind: u64, added: u64) -> Branch {
+        Branch {
+            name: name.into(),
+            tip: "abc".into(),
+            current: false,
+            rel_date: "3 days ago".into(),
+            worktree: None,
+            cmp: Some(Ok(BranchCmp {
+                merge_base: "def".into(),
+                ahead,
+                behind,
+                files: vec![stat("src/a.rs", added, 2)],
+            })),
+        }
+    }
+
+    fn sample_branches() -> Vec<Branch> {
+        vec![
+            branch("agent/fix-panes", 2, 0, 1234),
+            Branch { current: true, cmp: None, ..branch("main", 0, 0, 0) },
+        ]
+    }
+
+    #[test]
+    fn branch_list_keeps_its_full_layout_while_names_and_a_whole_bar_fit() {
+        // The longest name takes 18 cells with its marker. The fixed columns and
+        // their gaps take 59, and the bar 25 and a gap: 103 inside the borders.
+        let list = sample_branches();
+        for width in [105, 120, 200] {
+            let cols = branch_cols(width, &list);
+            assert!(cols.words, "width {width}");
+            assert_eq!(cols.widths, [width as usize - 87, 9, 11, 5, 7, 7, 25, 14], "width {width}");
+        }
+        assert_eq!(branch_cols(104, &list).widths[1], 7);
+    }
+
+    #[test]
+    fn branch_list_gives_up_padding_bar_words_and_date_before_names() {
+        let list = sample_branches();
+        // Padding first, and the bar is still whole. Date: `3 days ago`.
+        let cols = branch_cols(104, &list);
+        assert!(cols.words);
+        assert_eq!(cols.widths, [104 - 2 - 7 - 8 - 3 - 5 - 3 - 25 - 10 - 7, 7, 8, 3, 5, 3, 25, 10]);
+        // Then the bar shrinks, and the name column ends up with just the name.
+        let cols = branch_cols(70, &list);
+        assert!(cols.words);
+        assert_eq!(cols.widths, [18, 7, 8, 3, 5, 3, 7, 10]);
+        let cols = branch_cols(62, &list);
+        assert!(cols.words);
+        assert_eq!(cols.widths, [18, 7, 8, 3, 5, 3, 0, 10]);
+        // The words go next, leaving `↑2` and `↓0`, and the bar gets what they gave.
+        let cols = branch_cols(61, &list);
+        assert!(!cols.words);
+        assert_eq!(cols.widths, [18, 2, 2, 3, 5, 3, 9, 10]);
+        let cols = branch_cols(51, &list);
+        assert!(!cols.words);
+        assert_eq!(cols.widths, [18, 2, 2, 3, 5, 3, 0, 10]);
+        // Then the date, and the bar again.
+        assert_eq!(branch_cols(50, &list).widths, [18, 2, 2, 3, 5, 3, 9, 0]);
+        assert_eq!(branch_cols(40, &list).widths, [18, 2, 2, 3, 5, 3, 0, 0]);
+        // Nothing is left to give, so from here on the name is shortened...
+        assert_eq!(branch_cols(39, &list).widths, [17, 2, 2, 3, 5, 3, 0, 0]);
+        assert_eq!(branch_cols(38, &list).widths, [16, 2, 2, 3, 5, 3, 0, 0]);
+        // ...until it would be too short to read. Only `+` and `-` stay then, and
+        // the room goes to the name, not to a bar without the counts around it.
+        assert_eq!(branch_cols(37, &list).widths, [25, 0, 0, 0, 5, 3, 0, 0]);
+    }
+
+    #[test]
+    fn branch_bar_appears_only_when_it_can_draw_something() {
+        // The name takes 18. A bar takes its gap and its margin on top.
+        let list = sample_branches();
+        assert_eq!(branch_cols(64, &list).widths[..7], [20, 7, 8, 3, 5, 3, 0]);
+        assert_eq!(branch_cols(65, &list).widths[..7], [18, 7, 8, 3, 5, 3, 2]);
+    }
+
+    #[test]
+    fn branch_list_columns_add_up_to_the_panel_at_every_width() {
+        let list = sample_branches();
+        for width in 30..=200 {
+            let cols = branch_cols(width, &list);
+            assert_eq!(cols.widths[0] + beside(&cols.widths), width as usize - 2, "width {width}");
+        }
+    }
+
+    #[test]
+    fn branch_tags_go_before_the_name() {
+        let wt = Branch { worktree: Some("/tmp/wt".into()), ..branch("agent/feature", 1, 0, 5) };
+        // Marker (3), name (13), tag (9).
+        assert_eq!(branch_name(&wt, 25).to_string(), "   agent/feature worktree");
+        assert_eq!(branch_name(&wt, 24).to_string(), "   agent/feature");
+        assert_eq!(branch_name(&wt, 16).to_string(), "   agent/feature");
+        assert_eq!(branch_name(&wt, 15).to_string(), "   …/feature");
+        // The widest row with its tag takes 28 cells, and without it 16. Only the
+        // 16 can hide a column: here the date stays although no tag fits.
+        let list = vec![wt, Branch { cmp: Some(Err("x".into())), ..branch("orphan", 0, 0, 0) }];
+        let cols = branch_cols(47, &list);
+        assert_eq!((cols.widths[0], cols.widths[7]), (16, 10));
+        // A bar only gets what the tags leave. 42 of the 72 go to the other columns.
+        assert_eq!(branch_cols(100, &list).widths[6], 25);
+        assert_eq!(branch_cols(72, &list).widths[6], 0);
+        assert_eq!(branch_cols(73, &list).widths[6], 2);
+    }
+
+    /// 59 cells of name, 62 with the marker.
+    const LONG_BRANCH: &str = "agent/some-really-long-branch-name-that-goes-on-for-a-while";
+
+    #[test]
+    fn long_branch_name_wins_over_the_bar() {
+        let list = vec![branch(LONG_BRANCH, 1, 0, 5)];
+        // The bar yields all it has, and the name is shortened only after that.
+        let cols = branch_cols(100, &list);
+        assert_eq!((cols.widths[0], cols.widths[6]), (58, 0));
+        let screen = draw_table(100, 3, branch_table(&list, 100));
+        assert!(screen[1].contains("…/some-really-long"), "{}", screen[1]);
+        assert!(!screen[1].contains('━'), "{}", screen[1]);
+        // A bar shows up only when the whole name has fit.
+        let cols = branch_cols(105, &list);
+        assert_eq!((cols.widths[0], cols.widths[6]), (63, 0));
+        let cols = branch_cols(107, &list);
+        assert_eq!((cols.widths[0], cols.widths[6]), (62, 2));
+    }
+
+    #[test]
+    fn long_branch_name_takes_only_so_much_from_words_and_date() {
+        let list = vec![branch(LONG_BRANCH, 1, 0, 5)];
+        // Words and date stay as soon as 40 cells are left for it.
+        let cols = branch_cols(82, &list);
+        assert!(cols.words);
+        assert_eq!(cols.widths[0], NAME_GOAL);
+        let cols = branch_cols(81, &list);
+        assert!(!cols.words);
+        assert_eq!(cols.widths[7], 10);
+        let cols = branch_cols(71, &list);
+        assert_eq!((cols.widths[0], cols.widths[7]), (NAME_GOAL, 10));
+        assert_eq!(branch_cols(70, &list).widths[7], 0);
+    }
+
+    #[test]
+    fn names_never_get_less_room_than_the_fixed_columns_gave_them() {
+        // Those took 60 cells with their gaps, and the bar what names with their
+        // tags left. Narrow terminals must lose the bar, not the names.
+        let wt = Branch { worktree: Some("/tmp/wt".into()), ..branch("agent/feature", 1, 0, 5) };
+        for list in [vec![branch(LONG_BRANCH, 1, 0, 5)], vec![wt], sample_branches()] {
+            let full = list.iter().map(|b| branch_name(b, usize::MAX).width()).max().unwrap();
+            for width in 20..=250 {
+                let room = (width as usize).saturating_sub(2 + 60);
+                let old = room - room.saturating_sub(full).min(BAR + 1);
+                let name = branch_cols(width, &list).widths[0];
+                assert!(name >= old, "width {width}: {name} < {old} for {}", list[0].name);
+            }
+        }
+    }
+
+    #[test]
+    fn counts_are_never_clipped_in_the_branch_list() {
+        let list = vec![branch("data/huge", 123, 45678, 234_567_890)];
+        let cols = branch_cols(200, &list);
+        assert_eq!(cols.widths[1..6], [9, 12, 5, 10, 7]);
+        let cols = branch_cols(50, &list);
+        assert!(!cols.words);
+        assert_eq!(cols.widths[1..6], [4, 6, 3, 10, 3]);
+        assert_eq!(branch_cols(30, &list).widths[4..6], [10, 3]);
+    }
+
+    #[test]
+    fn branch_list_shows_names_and_counts_at_every_width() {
+        let mut list = sample_branches();
+        list.push(Branch { cmp: Some(Err("no merge base".into())), ..branch("orphan-history", 0, 0, 0) });
+        for width in 30..=130u16 {
+            let screen = draw_table(width, 5, branch_table(&list, width));
+            let row = &screen[1];
+            // A name loses its start, never its end.
+            assert!(row.contains("fix-panes"), "width {width}: {row}");
+            assert!(screen[3].contains("history"), "width {width}: {}", screen[3]);
+            assert!(screen[2].contains("* main"), "width {width}: {}", screen[2]);
+            assert!(row.contains("+1234") && row.contains("-2"), "width {width}: {row}");
+            // The other counts stay as long as the name stays readable.
+            assert_eq!(row.contains("1f"), width >= 38, "width {width}: {row}");
+            assert_eq!(row.contains("2 ahead") && row.contains("0 behind"), width >= 62, "width {width}: {row}");
+            assert_eq!(row.contains("↑2") && row.contains("↓0"), (38..62).contains(&width), "width {width}: {row}");
+            // Columns are hidden whole. None is left half-drawn.
+            assert_eq!(row.contains("3 days ago"), width >= 51, "width {width}: {row}");
+        }
+    }
+
+    #[test]
+    fn tiny_branch_lists_do_not_panic() {
+        for width in 1..30 {
+            draw_table(width, 4, branch_table(&sample_branches(), width));
+            draw_table(width, 4, branch_table(&[], width));
         }
     }
 }
