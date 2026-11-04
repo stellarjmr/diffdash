@@ -19,7 +19,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Cell, Paragraph, Row, Table, TableState};
 use ratatui::{DefaultTerminal, Frame};
 
-use git::{Branch, Branches, Bucket, Commit, FileStat, Log, Repo, Stats, WorkTree, totals};
+use git::{Branch, Branches, Bucket, Commit, FileStat, GraphRow, Log, Repo, Stats, WorkTree, totals};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const REFRESH: Duration = Duration::from_secs(2);
@@ -29,6 +29,8 @@ const NUM_W: usize = 8;
 /// In a file list, names up to this wide win over the bar. A longer one is
 /// shortened instead, so one deep path cannot erase the bar of every row.
 const NAME_GOAL: usize = 40;
+/// Cells of subject the commit list keeps before it starts hiding columns.
+const SUBJECT_GOAL: usize = 24;
 const INDENT: &str = "  ";
 const NEW_TAG: &str = " new";
 const RANGES: [(&str, Option<u32>); 4] =
@@ -882,52 +884,8 @@ impl App {
             return;
         };
         let [top, bottom] = Layout::vertical([Constraint::Percentage(62), Constraint::Fill(1)]).areas(area);
-        let rows: Vec<Row> = log
-            .rows
-            .iter()
-            .map(|r| {
-                let graph = Span::styled(r.graph.clone(), Style::new().fg(Color::Blue));
-                let Some(c) = r.commit.map(|i| &log.commits[i]) else {
-                    return Row::new(vec![Cell::from(Line::from(graph))]);
-                };
-                let (a, d) = totals(&c.files);
-                let (files, add, del) = if c.merge {
-                    (Span::styled("merge", Style::new().fg(DIM)), Span::raw(""), Span::raw(""))
-                } else {
-                    (
-                        Span::styled(format!("{}f", c.files.len()), Style::new().fg(DIM)),
-                        Span::styled(plus(a), Style::new().fg(ADD)),
-                        Span::styled(minus(d), Style::new().fg(DEL)),
-                    )
-                };
-                Row::new(vec![
-                    Cell::from(Line::from(vec![
-                        graph,
-                        Span::raw(" "),
-                        Span::styled(c.short.clone(), Style::new().fg(Color::Yellow)),
-                        Span::raw(" "),
-                        Span::raw(c.subject.clone()),
-                    ])),
-                    Cell::from(Line::from(c.author.clone()).fg(Color::Magenta)),
-                    Cell::from(Line::from(c.rel_date.clone()).fg(DIM)),
-                    Cell::from(Line::from(files).right_aligned()),
-                    Cell::from(Line::from(add).right_aligned()),
-                    Cell::from(Line::from(del).right_aligned()),
-                ])
-            })
-            .collect();
-        let widths = [
-            Constraint::Fill(1),
-            Constraint::Length(14),
-            Constraint::Length(14),
-            Constraint::Length(5),
-            Constraint::Length(7),
-            Constraint::Length(7),
-        ];
         let title = format!(" Log · latest {} commits ", log.commits.len());
-        let table = Table::new(rows, widths)
-            .block(panel().title(title))
-            .row_highlight_style(selected_style());
+        let table = log_table(log, top.width).block(panel().title(title));
         f.render_stateful_widget(table, top, &mut self.log_state);
 
         let block = panel();
@@ -1227,6 +1185,107 @@ fn render_files(frame: &mut Frame, area: Rect, block: Block<'static>, files: &[F
     frame.render_widget(file_table(rows, &cols).block(block), area);
 }
 
+/// Room left for a table's main column beside these other columns, each of
+/// which also takes a gap. A column of width 0 is hidden and takes neither.
+fn room_beside(inner: usize, others: &[usize]) -> usize {
+    inner.saturating_sub(others.iter().filter(|w| **w > 0).map(|w| w + 1).sum())
+}
+
+/// The cells or constraints of the columns that have a width, so that a hidden
+/// column does not take up a gap.
+fn shown<T>(widths: &[usize], items: impl IntoIterator<Item = T>) -> Vec<T> {
+    widths.iter().zip(items).filter(|(w, _)| **w > 0).map(|(_, item)| item).collect()
+}
+
+/// A table of rows built with [`shown`] from these widths.
+fn shown_table(rows: Vec<Row<'static>>, widths: &[usize]) -> Table<'static> {
+    let constraints = shown(widths, widths.iter().map(|w| Constraint::Length(*w as u16)));
+    Table::new(rows, constraints).row_highlight_style(selected_style())
+}
+
+/// Column widths of the commit list. `widths` is the commit (graph, hash and
+/// subject), author, date, files, added, deleted. `hash` is what the hash takes
+/// in the commit column, with its space: 0 when it is hidden.
+struct LogCols {
+    hash: usize,
+    widths: [usize; 6],
+}
+
+/// Fits the commit list into a panel `area_w` cells wide. Widths come from all
+/// commits, so scrolling does not move a column. While a useful stretch of
+/// subject fits, the columns have their full widths. Below that, the padding
+/// goes first, then the author, the date and the hash: the pane below still
+/// shows all three for the selected commit. A subject that is still too long is
+/// clipped on the right, where it matters least.
+fn log_cols(area_w: u16, log: &Log) -> LogCols {
+    let graph = log.rows.iter().map(|r| cells(&r.graph)).max().unwrap_or(0);
+    let (mut hash, mut subject, mut author, mut date) = (0, 0, 0, 0);
+    // Three cells keep small counts from shifting the columns.
+    let (mut files, mut add, mut del) = (3, 3, 3);
+    for c in &log.commits {
+        let (a, d) = totals(&c.files);
+        hash = hash.max(cells(&c.short) + 1);
+        subject = subject.max(cells(&c.subject));
+        author = author.max(cells(&c.author));
+        date = date.max(cells(&c.rel_date));
+        files = files.max(if c.merge { "merge".len() } else { format!("{}f", c.files.len()).len() });
+        add = add.max(plus(a).len());
+        del = del.max(minus(d).len());
+    }
+    let (author, date) = (author.min(14), date.min(14));
+    let inner = (area_w as usize).saturating_sub(2);
+    // The graph takes its own width and a space.
+    let need = graph + 1 + subject.min(SUBJECT_GOAL);
+    // Hash, then the columns beside the commit column.
+    let layouts = [
+        [hash, 14, 14, files.max(5), add.max(7), del.max(7)],
+        [hash, author, date, files, add, del],
+        [hash, 0, date, files, add, del],
+        [hash, 0, 0, files, add, del],
+        [0, 0, 0, files, add, del],
+    ];
+    let [hash, others @ ..] =
+        layouts.into_iter().find(|[h, others @ ..]| room_beside(inner, others) >= need + h).unwrap_or(layouts[4]);
+    let [author, date, files, add, del] = others;
+    LogCols { hash, widths: [room_beside(inner, &others), author, date, files, add, del] }
+}
+
+fn log_row(r: &GraphRow, log: &Log, cols: &LogCols) -> Row<'static> {
+    let graph = Span::styled(r.graph.clone(), Style::new().fg(Color::Blue));
+    let Some(c) = r.commit.map(|i| &log.commits[i]) else {
+        return Row::new(vec![Cell::from(Line::from(graph))]);
+    };
+    let (a, d) = totals(&c.files);
+    let (files, add, del) = if c.merge {
+        (Span::styled("merge", Style::new().fg(DIM)), Span::raw(""), Span::raw(""))
+    } else {
+        (
+            Span::styled(format!("{}f", c.files.len()), Style::new().fg(DIM)),
+            Span::styled(plus(a), Style::new().fg(ADD)),
+            Span::styled(minus(d), Style::new().fg(DEL)),
+        )
+    };
+    let mut commit = vec![graph, Span::raw(" ")];
+    if cols.hash > 0 {
+        commit.extend([Span::styled(c.short.clone(), Style::new().fg(Color::Yellow)), Span::raw(" ")]);
+    }
+    commit.push(Span::raw(c.subject.clone()));
+    Row::new(shown(&cols.widths, [
+        Cell::from(Line::from(commit)),
+        Cell::from(Line::from(c.author.clone()).fg(Color::Magenta)),
+        Cell::from(Line::from(c.rel_date.clone()).fg(DIM)),
+        Cell::from(Line::from(files).right_aligned()),
+        Cell::from(Line::from(add).right_aligned()),
+        Cell::from(Line::from(del).right_aligned()),
+    ]))
+}
+
+fn log_table(log: &Log, area_w: u16) -> Table<'static> {
+    let cols = log_cols(area_w, log);
+    let rows: Vec<Row> = log.rows.iter().map(|r| log_row(r, log, &cols)).collect();
+    shown_table(rows, &cols.widths)
+}
+
 /// Table of buckets whose bars are scaled to the space left in `area`, so a
 /// narrow pane shrinks every bar instead of clipping only the longest ones.
 fn bucket_table(list: &[Bucket], key_width: u16, area: Rect) -> Table<'static> {
@@ -1504,6 +1563,145 @@ mod tests {
         let files = [stat("a/b/c.rs", 12345, 678), stat("实验/数据.md", 1, 0)];
         for width in 1..40 {
             draw_files(width, &files);
+        }
+    }
+
+    /// Any table drawn into a real buffer, one string per screen row.
+    fn draw_table(width: u16, height: u16, table: Table<'static>) -> Vec<String> {
+        let mut t = Terminal::new(TestBackend::new(width, height)).unwrap();
+        t.draw(|f| {
+            let area = f.area();
+            f.render_widget(table.block(panel()), area);
+        })
+        .unwrap();
+        let b = t.backend().buffer();
+        (0..b.area.height).map(|y| (0..b.area.width).map(|x| b[(x, y)].symbol()).collect()).collect()
+    }
+
+    fn commit(short: &str, subject: &str, author: &str, added: u64) -> Commit {
+        Commit {
+            hash: format!("{short}000"),
+            short: short.into(),
+            author: author.into(),
+            rel_date: "10 minutes ago".into(),
+            date: "2026-11-04".into(),
+            merge: false,
+            subject: subject.into(),
+            files: vec![stat("src/main.rs", added, 2)],
+        }
+    }
+
+    /// Commits in a straight line, plus a connector row like merges have.
+    fn log_of(commits: Vec<Commit>) -> Log {
+        let mut rows: Vec<GraphRow> =
+            (0..commits.len()).map(|i| GraphRow { graph: "*".into(), commit: Some(i) }).collect();
+        rows.push(GraphRow { graph: "|\\".into(), commit: None });
+        Log { commits, rows }
+    }
+
+    const LONG_SUBJECT: &str = "Fix the narrow layout of a list that goes on and on";
+
+    fn sample_log() -> Log {
+        log_of(vec![
+            commit("f512c0e", LONG_SUBJECT, "Zhimin Chen", 1234),
+            commit("df86c88", "Short one", "claude[bot]", 5),
+        ])
+    }
+
+    /// What the columns other than the commit column take, gaps included.
+    fn beside(widths: &[usize]) -> usize {
+        widths[1..].iter().filter(|w| **w > 0).map(|w| w + 1).sum()
+    }
+
+    #[test]
+    fn commit_list_keeps_its_full_layout_while_the_subject_has_room() {
+        // Graph and space (3, the connector row is wider), hash and space (8),
+        // 24 of subject, then 47 of columns and 5 gaps: 87 inside the borders.
+        let log = sample_log();
+        for width in [89, 100, 200] {
+            let cols = log_cols(width, &log);
+            assert_eq!(cols.hash, 8, "width {width}");
+            assert_eq!(cols.widths, [width as usize - 54, 14, 14, 5, 7, 7], "width {width}");
+        }
+        assert_eq!(log_cols(88, &log).widths[3], 3);
+    }
+
+    #[test]
+    fn commit_list_gives_up_padding_then_author_date_and_hash() {
+        // A column stays while the commit column keeps 35 cells: graph and
+        // space (3), hash and space (8), 24 of subject.
+        let log = sample_log();
+        // The padding goes first: author and date fit their longest value.
+        assert_eq!(log_cols(88, &log).widths, [45, 11, 14, 3, 5, 3]);
+        // Then the author.
+        assert_eq!(log_cols(78, &log).widths, [35, 11, 14, 3, 5, 3]);
+        assert_eq!(log_cols(77, &log).widths, [46, 0, 14, 3, 5, 3]);
+        // Then the date.
+        assert_eq!(log_cols(66, &log).widths, [35, 0, 14, 3, 5, 3]);
+        assert_eq!(log_cols(65, &log).widths, [49, 0, 0, 3, 5, 3]);
+        // And last the hash.
+        let cols = log_cols(51, &log);
+        assert_eq!((cols.hash, cols.widths), (8, [35, 0, 0, 3, 5, 3]));
+        let cols = log_cols(50, &log);
+        assert_eq!((cols.hash, cols.widths), (0, [34, 0, 0, 3, 5, 3]));
+    }
+
+    #[test]
+    fn commit_list_columns_add_up_to_the_panel_at_every_width() {
+        let log = sample_log();
+        for width in 20..=200 {
+            let cols = log_cols(width, &log);
+            assert_eq!(cols.widths[0] + beside(&cols.widths), width as usize - 2, "width {width}");
+        }
+    }
+
+    #[test]
+    fn short_subjects_keep_the_columns_longer() {
+        let log = log_of(vec![commit("f512c0e", "Fix", "Zhimin Chen", 5)]);
+        // Graph and space (3), hash and space (8), subject (3): the author stays
+        // down to where the commit column holds just that.
+        assert_eq!(log_cols(55, &log).widths, [14, 11, 14, 3, 3, 3]);
+        assert_eq!(log_cols(54, &log).widths[1], 0);
+    }
+
+    #[test]
+    fn counts_are_never_clipped_in_the_commit_list() {
+        let log = log_of(vec![commit("f512c0e", LONG_SUBJECT, "Zhimin Chen", 123_456_789)]);
+        // Wider than the roomy 7 cells, at any width.
+        assert_eq!(log_cols(200, &log).widths[4], 10);
+        assert_eq!(log_cols(50, &log).widths[4], 10);
+    }
+
+    #[test]
+    fn merge_fits_the_files_column_of_a_narrow_commit_list() {
+        let mut merge = commit("f512c0e", "Merge branch 'x'", "Zhimin Chen", 0);
+        merge.merge = true;
+        merge.files.clear();
+        assert_eq!(log_cols(40, &log_of(vec![merge])).widths[3], 5);
+    }
+
+    #[test]
+    fn commit_list_shows_subject_and_counts_at_every_width() {
+        let log = sample_log();
+        // 33 is where the 14 cells of subject checked here still fit.
+        for width in 33..=130u16 {
+            let screen = draw_table(width, 5, log_table(&log, width));
+            assert!(screen[1].contains("Fix the narrow"), "width {width}: {}", screen[1]);
+            assert!(screen[1].contains("1f"), "width {width}: {}", screen[1]);
+            assert!(screen[1].contains("+1234") && screen[1].contains("-2"), "width {width}: {}", screen[1]);
+            assert!(screen[2].contains("Short one"), "width {width}: {}", screen[2]);
+            // Columns are hidden whole, in this order. None is left half-drawn.
+            assert_eq!(screen[1].contains("f512c0e"), width >= 51, "width {width}: {}", screen[1]);
+            assert_eq!(screen[1].contains("10 minutes ago"), width >= 66, "width {width}: {}", screen[1]);
+            assert_eq!(screen[1].contains("Zhimin Chen"), width >= 78, "width {width}: {}", screen[1]);
+        }
+    }
+
+    #[test]
+    fn tiny_commit_lists_do_not_panic() {
+        for width in 1..30 {
+            draw_table(width, 5, log_table(&sample_log(), width));
+            draw_table(width, 5, log_table(&Log::default(), width));
         }
     }
 }

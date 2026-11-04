@@ -5,6 +5,7 @@ All notable changes to `diffdash` are tracked here.
 ## Unreleased
 
 - Fix: file names could not be read in a narrow pane, such as a split screen. The file lists (Changes and the lower panes of Log and Branches) kept 41 cells for the numbers and the bar at any width, and a long path was clipped on the right, so at 60 columns a row showed `crates/diffd` and never reached the file. The lists now make room in this order: the padding of the number columns, the bar, then the path. A path that still does not fit loses whole directories from the left (`…/auth/login.rs`), and a rename shows only its new path after an arrow (`→ …/auth/login.rs`). A pane where every path already fit looks the same as before. Enter and `--once` still show full paths.
+- Fix: in a narrow pane, the Log tab's commit list lost the subject first. The author, date and number columns had fixed widths and the commit column got what was left, so at 60 columns a row read `* f512 t` and at 40 columns the hash and subject were gone. The list now gives up the padding, then the author, the date and the hash, in that order, to keep 24 cells of subject; the pane below still shows all three for the selected commit. Columns are hidden whole instead of being clipped to `8 minut`. A pane with room for that much subject looks the same as before.
 
 ## 0.2.1 - 2026-11-03
 
