@@ -24,6 +24,13 @@ use git::{Branch, Branches, Bucket, Commit, FileStat, Log, Repo, Stats, WorkTree
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const REFRESH: Duration = Duration::from_secs(2);
 const BAR: usize = 24;
+/// Number columns of a file list when there is room to spare.
+const NUM_W: usize = 8;
+/// In a file list, names up to this wide win over the bar. A longer one is
+/// shortened instead, so one deep path cannot erase the bar of every row.
+const NAME_GOAL: usize = 40;
+const INDENT: &str = "  ";
+const NEW_TAG: &str = " new";
 const RANGES: [(&str, Option<u32>); 4] =
     [("7d", Some(7)), ("30d", Some(30)), ("90d", Some(90)), ("all", None)];
 // New tabs go at the end so existing number keys keep their meaning.
@@ -206,11 +213,64 @@ fn churn(f: &FileStat) -> u64 {
     f.add() + f.del()
 }
 
+/// Terminal cells `s` takes up.
+fn cells(s: &str) -> usize {
+    Span::raw(s).width()
+}
+
 /// Left-align `s` to `width` terminal cells (CJK characters take two cells,
 /// which `{:<N}` formatting would not account for).
 fn pad(s: &str, width: usize) -> String {
-    let used = Span::raw(s).width();
-    format!("{s}{}", " ".repeat(width.saturating_sub(used)))
+    format!("{s}{}", " ".repeat(width.saturating_sub(cells(s))))
+}
+
+/// `path` in at most `width` cells, keeping its end. The file name says what
+/// changed, and a table cell clips on the right, which would leave only the
+/// top directory. Whole directories go first, from the left (`…/auth/login.rs`);
+/// the file name is cut only when nothing else is left (`…ogin.rs`).
+fn shorten_path(path: &str, width: usize) -> String {
+    if cells(path) <= width {
+        return path.to_string();
+    }
+    // git lists an embedded repository as `dir/`. Its name is the part to keep.
+    let body = path.trim_end_matches('/');
+    for (i, _) in body.match_indices('/') {
+        let short = format!("…{}", &path[i..]);
+        if cells(&short) <= width {
+            return short;
+        }
+    }
+    let file = &path[body.rfind('/').map_or(0, |i| i + 1)..];
+    if cells(file) <= width {
+        return file.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut used = cells("…");
+    let mut start = file.len();
+    for (i, c) in file.char_indices().rev() {
+        used += cells(c.encode_utf8(&mut [0; 4]));
+        if used > width {
+            break;
+        }
+        start = i;
+    }
+    format!("…{}", &file[start..])
+}
+
+/// `f`'s path in at most `width` cells. A rename that does not fit shows only
+/// where the file went; the arrow keeps it from reading as a plain edit.
+fn fit_path(f: &FileStat, width: usize) -> String {
+    let arrow = cells("→ ");
+    if f.old_path.is_none() || width <= arrow {
+        return shorten_path(&f.path, width);
+    }
+    let full = f.display_path();
+    if cells(&full) <= width {
+        return full;
+    }
+    format!("→ {}", shorten_path(&f.path, width - arrow))
 }
 
 fn repo_name(root: &Path) -> String {
@@ -786,6 +846,17 @@ impl App {
             f.render_widget(Paragraph::new(" working tree clean").fg(DIM).block(block), area);
             return;
         }
+        let cols = file_cols(
+            area.width,
+            self.work_rows.iter().map(|r| match r {
+                WorkRow::Header { title, count, added, deleted } => {
+                    (cells(&format!("{title} ({count})")), *added, *deleted)
+                }
+                WorkRow::File { kind, file } => {
+                    (file_name_width(file, *kind == Kind::Untracked), file.add(), file.del())
+                }
+            }),
+        );
         let rows: Vec<Row> = self
             .work_rows
             .iter()
@@ -799,10 +870,10 @@ impl App {
                     Cell::from(Line::from(minus(*deleted)).right_aligned().fg(DEL).bold()),
                     Cell::from(""),
                 ]),
-                WorkRow::File { kind, file } => file_row(file, max, *kind == Kind::Untracked),
+                WorkRow::File { kind, file } => file_row(file, max, *kind == Kind::Untracked, &cols),
             })
             .collect();
-        f.render_stateful_widget(file_table(rows).block(block), area, &mut self.work_state);
+        f.render_stateful_widget(file_table(rows, &cols).block(block), area, &mut self.work_state);
     }
 
     fn render_log(&mut self, f: &mut Frame, area: Rect) {
@@ -879,11 +950,7 @@ impl App {
             f.render_widget(Paragraph::new(msg).fg(DIM).block(block), bottom);
             return;
         }
-        let mut files: Vec<&FileStat> = c.files.iter().collect();
-        files.sort_by_key(|f| std::cmp::Reverse(churn(f)));
-        let max = files.first().map_or(0, |f| churn(f));
-        let rows: Vec<Row> = files.iter().map(|f| file_row(f, max, false)).collect();
-        f.render_widget(file_table(rows).block(block), bottom);
+        render_files(f, bottom, block, &c.files);
     }
 
     fn render_stats(&mut self, f: &mut Frame, area: Rect) {
@@ -1021,11 +1088,7 @@ impl App {
             f.render_widget(Paragraph::new(msg).fg(DIM).block(block), bottom);
             return;
         }
-        let mut files: Vec<&FileStat> = c.files.iter().collect();
-        files.sort_by_key(|f| std::cmp::Reverse(churn(f)));
-        let max = files.first().map_or(0, |f| churn(f));
-        let rows: Vec<Row> = files.iter().map(|f| file_row(f, max, false)).collect();
-        f.render_widget(file_table(rows).block(block), bottom);
+        render_files(f, bottom, block, &c.files);
     }
 }
 
@@ -1090,10 +1153,48 @@ fn tilde(path: &str) -> String {
     }
 }
 
-fn file_row(f: &FileStat, max: u64, untracked: bool) -> Row<'static> {
-    let mut name = vec![Span::raw("  "), Span::raw(f.display_path())];
+/// Column widths of a file list. `bar_col` is the bar plus one cell of margin.
+struct FileCols {
+    name: usize,
+    add: usize,
+    del: usize,
+    bar_col: usize,
+}
+
+/// Fits a file list into a panel `area_w` cells wide, given each row's full
+/// name width and its added and deleted counts. As room runs out, the padding
+/// of the number columns goes first, then the bar, and only then do names get
+/// shortened.
+fn file_cols(area_w: u16, rows: impl Iterator<Item = (usize, u64, u64)>) -> FileCols {
+    // Three cells fit `bin` and keep small counts from shifting the columns.
+    let (mut name, mut add, mut del) = (0, 3, 3);
+    for (n, a, d) in rows {
+        name = name.max(n);
+        add = add.max(plus(a).len());
+        del = del.max(minus(d).len());
+    }
+    // Two borders and the three gaps between the columns.
+    let inner = (area_w as usize).saturating_sub(2 + 3);
+    if inner > name + 2 * NUM_W + BAR {
+        add = add.max(NUM_W);
+        del = del.max(NUM_W);
+    }
+    let room = inner.saturating_sub(add + del);
+    let bar_col = room.saturating_sub(name.min(NAME_GOAL)).min(BAR + 1);
+    FileCols { name: room - bar_col, add, del, bar_col }
+}
+
+/// Cells the name column needs to show `f` in full.
+fn file_name_width(f: &FileStat, untracked: bool) -> usize {
+    INDENT.len() + cells(&f.display_path()) + if untracked { NEW_TAG.len() } else { 0 }
+}
+
+fn file_row(f: &FileStat, max: u64, untracked: bool, cols: &FileCols) -> Row<'static> {
+    let tag = if untracked { NEW_TAG } else { "" };
+    let room = cols.name.saturating_sub(INDENT.len() + tag.len());
+    let mut name = vec![Span::raw(INDENT), Span::raw(fit_path(f, room))];
     if untracked {
-        name.push(Span::styled(" new", Style::new().fg(ADD)));
+        name.push(Span::styled(NEW_TAG, Style::new().fg(ADD)));
     }
     if f.is_binary() {
         return Row::new(vec![
@@ -1107,18 +1208,23 @@ fn file_row(f: &FileStat, max: u64, untracked: bool) -> Row<'static> {
         Cell::from(Line::from(name)),
         Cell::from(Line::from(plus(f.add())).right_aligned().fg(ADD)),
         Cell::from(Line::from(minus(f.del())).right_aligned().fg(DEL)),
-        Cell::from(bar_line(f.add(), f.del(), max, BAR)),
+        Cell::from(bar_line(f.add(), f.del(), max, cols.bar_col.saturating_sub(1))),
     ])
 }
 
-fn file_table(rows: Vec<Row<'static>>) -> Table<'static> {
-    let widths = [
-        Constraint::Fill(1),
-        Constraint::Length(8),
-        Constraint::Length(8),
-        Constraint::Length(BAR as u16 + 1),
-    ];
+fn file_table(rows: Vec<Row<'static>>, cols: &FileCols) -> Table<'static> {
+    let widths = [cols.name, cols.add, cols.del, cols.bar_col].map(|w| Constraint::Length(w as u16));
     Table::new(rows, widths).row_highlight_style(selected_style())
+}
+
+/// The file list of a commit or branch, largest change first.
+fn render_files(frame: &mut Frame, area: Rect, block: Block<'static>, files: &[FileStat]) {
+    let mut files: Vec<&FileStat> = files.iter().collect();
+    files.sort_by_key(|f| std::cmp::Reverse(churn(f)));
+    let max = files.first().map_or(0, |f| churn(f));
+    let cols = file_cols(area.width, files.iter().map(|f| (file_name_width(f, false), f.add(), f.del())));
+    let rows: Vec<Row> = files.iter().map(|f| file_row(f, max, false, &cols)).collect();
+    frame.render_widget(file_table(rows, &cols).block(block), area);
 }
 
 /// Table of buckets whose bars are scaled to the space left in `area`, so a
@@ -1224,4 +1330,180 @@ fn run_tui(repo: Arc<Repo>, o: &Opts) -> Result<(), String> {
     })();
     ratatui::restore();
     res.map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn stat(path: &str, added: u64, deleted: u64) -> FileStat {
+        FileStat { path: path.into(), old_path: None, added: Some(added), deleted: Some(deleted) }
+    }
+
+    /// A file list drawn into a real buffer, one string per screen row. Wide
+    /// characters leave a blank cell behind them, so the tests use ASCII paths.
+    fn draw_files(width: u16, files: &[FileStat]) -> Vec<String> {
+        let mut t = Terminal::new(TestBackend::new(width, files.len() as u16 + 2)).unwrap();
+        t.draw(|f| {
+            let area = f.area();
+            render_files(f, area, panel(), files);
+        })
+        .unwrap();
+        let b = t.backend().buffer();
+        (0..b.area.height).map(|y| (0..b.area.width).map(|x| b[(x, y)].symbol()).collect()).collect()
+    }
+
+    const DEEP: &str = "crates/core/src/handlers/auth/login.rs";
+
+    #[test]
+    fn path_that_fits_is_untouched() {
+        assert_eq!(shorten_path(DEEP, DEEP.len()), DEEP);
+        assert_eq!(shorten_path(DEEP, 100), DEEP);
+        assert_eq!(shorten_path("README.md", 9), "README.md");
+    }
+
+    #[test]
+    fn directories_go_first_and_from_the_left() {
+        assert_eq!(shorten_path(DEEP, DEEP.len() - 1), "…/core/src/handlers/auth/login.rs");
+        assert_eq!(shorten_path(DEEP, 28), "…/src/handlers/auth/login.rs");
+        assert_eq!(shorten_path(DEEP, 27), "…/handlers/auth/login.rs");
+        assert_eq!(shorten_path(DEEP, 15), "…/auth/login.rs");
+        assert_eq!(shorten_path(DEEP, 14), "…/login.rs");
+        assert_eq!(shorten_path(DEEP, 10), "…/login.rs");
+    }
+
+    #[test]
+    fn file_name_is_cut_last() {
+        assert_eq!(shorten_path(DEEP, 9), "login.rs");
+        assert_eq!(shorten_path(DEEP, 8), "login.rs");
+        assert_eq!(shorten_path(DEEP, 7), "…gin.rs");
+        assert_eq!(shorten_path(DEEP, 1), "…");
+        assert_eq!(shorten_path(DEEP, 0), "");
+        assert_eq!(shorten_path("a_long_file_name.rs", 8), "…name.rs");
+    }
+
+    #[test]
+    fn embedded_repo_keeps_its_name() {
+        // git lists these with a trailing slash; `…/` alone would say nothing.
+        let path = "vendor/third_party/inner/";
+        assert_eq!(shorten_path(path, 20), "…/third_party/inner/");
+        assert_eq!(shorten_path(path, 8), "…/inner/");
+        assert_eq!(shorten_path(path, 6), "inner/");
+        assert_eq!(shorten_path(path, 4), "…er/");
+    }
+
+    #[test]
+    fn wide_characters_count_two_cells() {
+        let path = "实验/笔记/数据分析报告.md";
+        assert_eq!(cells(path), 25);
+        assert_eq!(shorten_path(path, 25), path);
+        assert_eq!(shorten_path(path, 24), "…/笔记/数据分析报告.md");
+        assert_eq!(shorten_path(path, 21), "…/数据分析报告.md");
+        // The six cells after the `…` hold `.md` and one wide character; half
+        // of a second one must not spill over.
+        assert_eq!(shorten_path(path, 7), "…告.md");
+        for width in 0..30 {
+            assert!(cells(&shorten_path(path, width)) <= width, "width {width}");
+        }
+    }
+
+    #[test]
+    fn rename_that_does_not_fit_shows_where_it_went() {
+        let f = FileStat {
+            path: "src/handlers/new_name.rs".into(),
+            old_path: Some("src/old_name.rs".into()),
+            added: Some(1),
+            deleted: Some(0),
+        };
+        let full = "src/old_name.rs → src/handlers/new_name.rs";
+        assert_eq!(fit_path(&f, cells(full)), full);
+        assert_eq!(fit_path(&f, cells(full) - 1), "→ src/handlers/new_name.rs");
+        assert_eq!(fit_path(&f, 16), "→ …/new_name.rs");
+        assert_eq!(fit_path(&f, 13), "→ new_name.rs");
+        for width in 0..50 {
+            assert!(cells(&fit_path(&f, width)) <= width, "width {width}");
+        }
+    }
+
+    #[test]
+    fn full_layout_is_kept_while_every_name_fits_it() {
+        // Number columns of NUM_W, a whole bar, and the name column gets the rest.
+        for width in [106, 120, 200] {
+            let cols = file_cols(width, [(60, 12, 3)].into_iter());
+            assert_eq!((cols.add, cols.del, cols.bar_col), (NUM_W, NUM_W, BAR + 1), "width {width}");
+            assert_eq!(cols.name, width as usize - 5 - 2 * NUM_W - (BAR + 1));
+        }
+        // Short names keep it down to a much narrower panel, and one cell less
+        // is where it stops.
+        let cols = file_cols(59, [(13, 12, 3)].into_iter());
+        assert_eq!((cols.name, cols.add, cols.del, cols.bar_col), (13, NUM_W, NUM_W, BAR + 1));
+        let cols = file_cols(58, [(13, 12, 3)].into_iter());
+        assert_eq!((cols.add, cols.del), (3, 3));
+    }
+
+    #[test]
+    fn number_padding_then_bar_give_way_to_the_names() {
+        // Padding goes first: the bar stays whole while the numbers tighten.
+        let cols = file_cols(80, [(40, 1234, 5)].into_iter());
+        assert_eq!((cols.name, cols.add, cols.del, cols.bar_col), (42, 5, 3, BAR + 1));
+        // Then the bar shrinks until the name fits.
+        let cols = file_cols(60, [(40, 1234, 5)].into_iter());
+        assert_eq!((cols.name, cols.add, cols.del, cols.bar_col), (40, 5, 3, 7));
+        // And goes away entirely before any name is shortened.
+        let cols = file_cols(40, [(30, 1234, 5)].into_iter());
+        assert_eq!((cols.name, cols.add, cols.del, cols.bar_col), (27, 5, 3, 0));
+    }
+
+    #[test]
+    fn one_very_long_name_does_not_erase_the_bars() {
+        // It takes the padding, but the bar only yields up to NAME_GOAL.
+        let cols = file_cols(120, [(200, 12, 3)].into_iter());
+        assert_eq!((cols.name, cols.add, cols.del, cols.bar_col), (84, 3, 3, BAR + 1));
+        let cols = file_cols(60, [(200, 12, 3)].into_iter());
+        assert_eq!((cols.name, cols.add, cols.del, cols.bar_col), (NAME_GOAL, 3, 3, 9));
+    }
+
+    #[test]
+    fn number_columns_fit_their_widest_value() {
+        let cols = file_cols(40, [(10, 1, 1), (10, 123456, 1), (10, 1, 1234)].into_iter());
+        assert_eq!((cols.add, cols.del), (7, 5));
+        // `bin` goes in the deleted column, and huge counts are not clipped.
+        let cols = file_cols(40, [(10, 1, 1)].into_iter());
+        assert_eq!(cols.del, 3);
+        let cols = file_cols(200, [(10, 1_000_000_000, 1)].into_iter());
+        assert_eq!(cols.add, 11);
+    }
+
+    #[test]
+    fn narrow_panel_still_shows_every_file_name() {
+        let files = [
+            stat("crates/core/src/handlers/auth/session.rs", 1234, 5),
+            stat("experiments/2026/results/long_table_name.csv", 12, 0),
+            stat("README.md", 4, 0),
+        ];
+        // 34 is where the longest file name (19 cells) still fits whole.
+        for width in 34..=130 {
+            let screen = draw_files(width, &files);
+            // Rows are sorted by churn; row 0 is the top border.
+            for (row, name) in screen[1..].iter().zip(["session.rs", "long_table_name.csv", "README.md"]) {
+                assert!(row.contains(name), "width {width}: {row}");
+            }
+            assert!(screen[1].contains("+1234") && screen[1].contains("-5"), "width {width}: {}", screen[1]);
+            // Nothing is shortened or dropped once the panel is wide enough.
+            if width >= 96 {
+                assert!(screen[1].contains(&files[0].path), "width {width}: {}", screen[1]);
+                assert!(screen[1].contains(&"━".repeat(BAR)), "width {width}: {}", screen[1]);
+            }
+        }
+    }
+
+    #[test]
+    fn tiny_panels_do_not_panic() {
+        let files = [stat("a/b/c.rs", 12345, 678), stat("实验/数据.md", 1, 0)];
+        for width in 1..40 {
+            draw_files(width, &files);
+        }
+    }
 }

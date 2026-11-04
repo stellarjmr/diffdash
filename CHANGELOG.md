@@ -4,6 +4,8 @@ All notable changes to `diffdash` are tracked here.
 
 ## Unreleased
 
+- Fix: file names could not be read in a narrow pane, such as a split screen. The file lists (Changes and the lower panes of Log and Branches) kept 41 cells for the numbers and the bar at any width, and a long path was clipped on the right, so at 60 columns a row showed `crates/diffd` and never reached the file. The lists now make room in this order: the padding of the number columns, the bar, then the path. A path that still does not fit loses whole directories from the left (`…/auth/login.rs`), and a rename shows only its new path after an arrow (`→ …/auth/login.rs`). A pane where every path already fit looks the same as before. Enter and `--once` still show full paths.
+
 ## 0.2.1 - 2026-11-03
 
 - The tab bar at the top and the key hints at the bottom now sit in rounded boxes of their own, like the panels between them. They used to be bare lines of text above and below the boxed panels; now the whole screen has one look. Each bar takes three rows instead of one, so the panels get four fewer rows.
