@@ -55,6 +55,13 @@ const RANGES: [(&str, Option<u32>); 4] =
     [("7d", Some(7)), ("30d", Some(30)), ("90d", Some(90)), ("all", None)];
 // New tabs go at the end so existing number keys keep their meaning.
 const TABS: [&str; 4] = ["Changes", "Log", "Stats", "Branches"];
+/// The key hints of each tab, in the order a narrow bar keeps them.
+const HINTS: [&[&str]; 4] = [
+    &["j/k move", "Enter diff", "r refresh", "1-4 tabs", "q quit"],
+    &["j/k move", "Enter show commit", "r refresh", "1-4 tabs", "q quit"],
+    &["t range", "j/k scroll", "r refresh", "1-4 tabs", "q quit"],
+    &["j/k move", "Enter branch diff", "r refresh", "1-4 tabs", "q quit"],
+];
 
 // Only ANSI palette colors and REVERSED, so the UI follows the terminal theme
 // (light or dark).
@@ -358,6 +365,38 @@ fn top_line(area_w: u16, repo: &str, branch: &str, tab: usize) -> Line<'static> 
             spans.extend(pill(label(i, words), None));
         } else {
             spans.extend(pill_slot(label(i, words), Style::new().fg(DIM)));
+        }
+    }
+    Line::from(spans)
+}
+
+/// The line in the bottom bar of a box `area_w` wide. What is going on comes before
+/// what could be done: key hints go whole, from the end, until `loading…` and the
+/// error fit. Then `loading…` goes, and then the end of the error, which says the
+/// least: git's own words come first.
+fn bottom_line(area_w: u16, tab: usize, loading: bool, error: Option<&str>) -> Line<'static> {
+    const LOADING: &str = "loading…";
+    let inner = (area_w as usize).saturating_sub(2);
+    // The bar has one row, and git's errors can have several lines.
+    let error = error.unwrap_or("").replace('\n', " ");
+    let wanted = if loading { LOADING } else { "" };
+    let status: usize = [wanted, error.as_str()].iter().filter(|s| !s.is_empty()).map(|s| 2 + cells(s)).sum();
+    let room = inner.saturating_sub(1 + status);
+    let loading = if error.is_empty() || 1 + cells(wanted) + 2 + cells(&error) <= inner { wanted } else { "" };
+    let mut hints = String::new();
+    for hint in HINTS[tab] {
+        let next = if hints.is_empty() { hint.to_string() } else { format!("{hints} · {hint}") };
+        if cells(&next) > room {
+            break;
+        }
+        hints = next;
+    }
+    let error = clip(&error, inner.saturating_sub(1));
+    let mut spans = Vec::new();
+    for (text, color) in [(hints, DIM), (loading.to_string(), ACCENT), (error, DEL)] {
+        if !text.is_empty() {
+            spans.push(Span::raw(if spans.is_empty() { " " } else { "  " }));
+            spans.push(Span::styled(text, Style::new().fg(color)));
         }
     }
     Line::from(spans)
@@ -884,21 +923,10 @@ impl App {
     }
 
     fn render_bottom(&self, f: &mut Frame, area: Rect) {
-        let hint = match self.tab {
-            0 => "j/k move · Enter diff · r refresh · 1-4 tabs · q quit",
-            1 => "j/k move · Enter show commit · r refresh · 1-4 tabs · q quit",
-            2 => "t range · j/k scroll · r refresh · 1-4 tabs · q quit",
-            _ => "j/k move · Enter branch diff · r refresh · 1-4 tabs · q quit",
-        };
-        let mut spans = vec![Span::styled(format!(" {hint}"), Style::new().fg(DIM))];
         // The 2 s working-tree poll is not shown; it would flicker constantly.
-        if self.busy[LOG] || self.busy[STATS] || self.busy[BRANCHES] {
-            spans.push(Span::styled("  loading…", Style::new().fg(ACCENT)));
-        }
-        if let Some(e) = self.errors.iter().flatten().next() {
-            spans.push(Span::styled(format!("  {e}"), Style::new().fg(DEL)));
-        }
-        f.render_widget(Paragraph::new(Line::from(spans)).block(panel()), area);
+        let loading = self.busy[LOG] || self.busy[STATS] || self.busy[BRANCHES];
+        let error = self.errors.iter().flatten().next().map(String::as_str);
+        f.render_widget(Paragraph::new(bottom_line(area.width, self.tab, loading, error)).block(panel()), area);
     }
 
     fn render_changes(&mut self, f: &mut Frame, area: Rect) {
@@ -2707,6 +2735,93 @@ mod tests {
             let row = &rows_of(&t)[3];
             assert_eq!(row.contains("By top-level directory"), long, "width {width}: {row}");
             assert_eq!(row.contains("By directory"), !long, "width {width}: {row}");
+        }
+    }
+
+    fn bottom_text(width: u16, tab: usize, loading: bool, error: Option<&str>) -> String {
+        text_of(&bottom_line(width, tab, loading, error))
+    }
+
+    const WHY: &str = "fatal: bad object HEAD (git diff --cached --numstat -z HEAD)";
+
+    #[test]
+    fn bottom_bar_stays_as_it_was_while_everything_fits() {
+        let old = [
+            "j/k move · Enter diff · r refresh · 1-4 tabs · q quit",
+            "j/k move · Enter show commit · r refresh · 1-4 tabs · q quit",
+            "t range · j/k scroll · r refresh · 1-4 tabs · q quit",
+            "j/k move · Enter branch diff · r refresh · 1-4 tabs · q quit",
+        ];
+        for (tab, hint) in old.iter().enumerate() {
+            assert_eq!(bottom_text(200, tab, false, None), format!(" {hint}"));
+            assert_eq!(bottom_text(200, tab, true, None), format!(" {hint}  loading…"));
+            assert_eq!(bottom_text(200, tab, false, Some("boom")), format!(" {hint}  boom"));
+            assert_eq!(bottom_text(200, tab, true, Some("boom")), format!(" {hint}  loading…  boom"));
+        }
+    }
+
+    #[test]
+    fn hints_go_whole_and_from_the_end() {
+        for (tab, hints) in HINTS.iter().enumerate() {
+            for width in 3..=100u16 {
+                let line = bottom_text(width, tab, false, None);
+                assert!(cells(&line) <= (width as usize).saturating_sub(2), "width {width}: {line}");
+                let shown: Vec<&str> = line.trim_start().split(" · ").filter(|h| !h.is_empty()).collect();
+                assert_eq!(shown, hints[..shown.len()], "width {width}");
+            }
+        }
+        assert_eq!(bottom_text(60, 1, false, None), " j/k move · Enter show commit · r refresh · 1-4 tabs");
+        assert_eq!(bottom_text(40, 1, false, None), " j/k move · Enter show commit");
+    }
+
+    #[test]
+    fn loading_and_errors_show_before_any_hint() {
+        for tab in 0..TABS.len() {
+            for width in 14..=100u16 {
+                let line = bottom_text(width, tab, false, Some("fatal: boom"));
+                assert!(line.ends_with("  fatal: boom") || line == " fatal: boom", "width {width}: {line}");
+                assert!(cells(&line) <= width as usize - 2, "width {width}: {line}");
+                let line = bottom_text(width, tab, true, None);
+                assert!(line.contains("loading…"), "width {width}: {line}");
+                assert!(cells(&line) <= width as usize - 2, "width {width}: {line}");
+            }
+            // Both, then the error alone.
+            assert_eq!(bottom_text(24, tab, true, Some("fatal: boom")), " loading…  fatal: boom");
+            assert_eq!(bottom_text(23, tab, true, Some("fatal: boom")), " fatal: boom");
+        }
+    }
+
+    #[test]
+    fn long_error_stands_alone_and_keeps_its_start() {
+        assert_eq!(bottom_text(40, 0, true, Some(WHY)), " fatal: bad object HEAD (git diff --c…");
+        // The whole message takes 60 cells and its leading space one.
+        assert_eq!(bottom_text(63, 0, false, Some(WHY)), format!(" {WHY}"));
+        assert_eq!(bottom_text(62, 0, false, Some(WHY)), " fatal: bad object HEAD (git diff --cached --numstat -z HEA…");
+    }
+
+    #[test]
+    fn errors_stay_on_the_one_row_of_the_bar() {
+        let line = bottom_line(60, 0, false, Some("fatal: one\nhint: two"));
+        assert_eq!(text_of(&line), " j/k move · Enter diff · r refresh  fatal: one hint: two");
+        assert!(!text_of(&line).contains('\n'));
+    }
+
+    #[test]
+    fn tiny_bottom_bars_do_not_panic() {
+        for width in 0..24u16 {
+            for error in [None, Some("fatal: boom"), Some(WHY), Some("陈志民陈志民")] {
+                for loading in [false, true] {
+                    let line = bottom_line(width, 3, loading, error);
+                    if width > 0 {
+                        let mut t = Terminal::new(TestBackend::new(width, 3)).unwrap();
+                        t.draw(|f| {
+                            let area = f.area();
+                            f.render_widget(Paragraph::new(line.clone()).block(panel()), area);
+                        })
+                        .unwrap();
+                    }
+                }
+            }
         }
     }
 

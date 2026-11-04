@@ -155,6 +155,16 @@ const BRANCH_FORMAT: &str =
 
 // ---------------------------------------------------------------- running git
 
+/// A failed git call, with git's own words first. A narrow pane keeps the start of
+/// a message, and the arguments can be long enough to fill any row before the reason.
+fn failure(args: &[&str], stderr: &str) -> String {
+    let cmd = args.join(" ");
+    match stderr.trim() {
+        "" => format!("git {cmd} failed"),
+        why => format!("{why} (git {cmd})"),
+    }
+}
+
 /// Base command for every git call, so the read-only settings cannot be left
 /// out. Both keep diffdash from writing `.git/index`, which would take
 /// `.git/index.lock` and could make a concurrent `git commit` (e.g. by an
@@ -217,11 +227,7 @@ impl Repo {
         // `git diff --no-index` exits 1 when files differ; treat 0/1 as success.
         match out.status.code() {
             Some(0) | Some(1) => Ok(out.stdout),
-            _ => Err(format!(
-                "git {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            )),
+            _ => Err(failure(args, &String::from_utf8_lossy(&out.stderr))),
         }
     }
 
@@ -780,6 +786,29 @@ mod tests {
         assert_eq!(first, second);
 
         fs::remove_dir_all(&wt).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failure_says_why_first() {
+        assert_eq!(failure(&["log", "-n1"], "fatal: bad object HEAD\n"), "fatal: bad object HEAD (git log -n1)");
+        assert_eq!(failure(&["log", "-n1"], "  \n"), "git log -n1 failed");
+    }
+
+    #[test]
+    fn a_broken_repo_reports_why_before_the_command() {
+        let dir = std::env::temp_dir().join(format!("diffdash-broken-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        setup_git(&dir, &["init", "-q", "-b", "main"]);
+        setup_git(&dir, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        fs::write(dir.join(".git/refs/heads/main"), "0000000000000000000000000000000000000001\n").unwrap();
+
+        let repo = Repo::open(&dir).unwrap();
+        // git's own words can be translated, so this checks only where they are.
+        let e = repo.worktree().err().unwrap();
+        assert!(!e.starts_with("git "), "{e}");
+        assert!(e.contains(" (git diff ") && e.ends_with(')'), "{e}");
         fs::remove_dir_all(&dir).unwrap();
     }
 
