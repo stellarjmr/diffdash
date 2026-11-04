@@ -16,7 +16,7 @@ use ratatui::crossterm::{cursor, execute};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Cell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, BorderType, Cell, Padding, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
 use git::{Branch, Branches, Bucket, Commit, FileStat, GraphRow, Log, Repo, Stats, WorkTree, totals};
@@ -70,6 +70,12 @@ fn selected_style() -> Style {
 /// Every box in the UI: rounded corners (╭╮╰╯) with a dim border.
 fn panel<'a>() -> Block<'a> {
     Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(DIM))
+}
+
+/// A message in place of a list. It wraps, so that a narrow pane does not lose its
+/// end, and the padding keeps every line one cell from the edge, like a list row.
+fn message(text: impl Into<String>, color: Color, block: Block<'static>) -> Paragraph<'static> {
+    Paragraph::new(text.into()).fg(color).wrap(Wrap { trim: true }).block(block.padding(Padding::horizontal(1)))
 }
 
 /// Powerline half circles (U+E0B6 / U+E0B4) used as the rounded ends of a
@@ -818,8 +824,9 @@ impl App {
     /// Shown while a tab has no data yet: its error if loading failed, else "loading…".
     fn placeholder(&self, source: usize) -> Paragraph<'static> {
         match &self.errors[source] {
-            Some(e) => Paragraph::new(format!(" {e}")).fg(DEL),
-            None => Paragraph::new(" loading…").fg(DIM),
+            // No box here, only the padding.
+            Some(e) => message(e.clone(), DEL, Block::new()),
+            None => message("loading…", DIM, Block::new()),
         }
     }
 
@@ -910,7 +917,7 @@ impl App {
         ]);
         let block = panel().title(title);
         if self.work_rows.is_empty() {
-            f.render_widget(Paragraph::new(" working tree clean").fg(DIM).block(block), area);
+            f.render_widget(message("working tree clean", DIM, block), area);
             return;
         }
         let cols = file_cols(
@@ -969,8 +976,8 @@ impl App {
         ]);
         let block = block.title(title);
         if c.merge {
-            let msg = " merge commit: git log reports no per-file stats for merges (Enter shows the commit)";
-            f.render_widget(Paragraph::new(msg).fg(DIM).block(block), bottom);
+            let msg = "merge commit: git log reports no per-file stats for merges (Enter shows the commit)";
+            f.render_widget(message(msg, DIM, block), bottom);
             return;
         }
         render_files(f, bottom, block, &c.files);
@@ -991,7 +998,7 @@ impl App {
         };
         let title = format!(" Branches · {} local · compared with {} ", br.list.len(), br.head_name);
         if br.list.is_empty() {
-            f.render_widget(Paragraph::new(" no branches yet").fg(DIM).block(panel().title(title)), area);
+            f.render_widget(message("no branches yet", DIM, panel().title(title)), area);
             return;
         }
         // Branch lists are usually short; the selected branch's files get the rest.
@@ -1017,14 +1024,14 @@ impl App {
                 let (title, text, color) = match other {
                     _ if b.current => (
                         "· current branch ",
-                        " the other branches are compared with this one, from where they forked".to_string(),
+                        "the other branches are compared with this one, from where they forked".to_string(),
                         DIM,
                     ),
-                    Some(Err(e)) => ("", format!(" {e}"), DEL),
-                    _ => ("", " HEAD has no commits yet, so there is nothing to compare with".to_string(), DIM),
+                    Some(Err(e)) => ("", e.clone(), DEL),
+                    _ => ("", "HEAD has no commits yet, so there is nothing to compare with".to_string(), DIM),
                 };
                 let block = block.title(Line::from(vec![name, Span::raw(title)]));
-                f.render_widget(Paragraph::new(text).fg(color).block(block), bottom);
+                f.render_widget(message(text, color, block), bottom);
                 return;
             }
         };
@@ -1046,11 +1053,11 @@ impl App {
         let block = block.title(title);
         if c.files.is_empty() {
             let msg = if c.ahead == 0 {
-                format!(" every commit on this branch is already in {}", br.head_name)
+                format!("every commit on this branch is already in {}", br.head_name)
             } else {
-                " no file changes since the merge base".to_string()
+                "no file changes since the merge base".to_string()
             };
-            f.render_widget(Paragraph::new(msg).fg(DIM).block(block), bottom);
+            f.render_widget(message(msg, DIM, block), bottom);
             return;
         }
         render_files(f, bottom, block, &c.files);
@@ -2430,6 +2437,74 @@ mod tests {
         assert_eq!(fit_names(5, "repo", long), (String::new(), String::new()));
         assert_eq!(fit_names(4, "repo", "main"), (String::new(), "main".to_string()));
         assert_eq!(fit_names(0, "repo", "main"), (String::new(), String::new()));
+    }
+
+    fn draw_message(width: u16, height: u16, text: &str) -> Vec<String> {
+        let mut t = Terminal::new(TestBackend::new(width, height)).unwrap();
+        t.draw(|f| {
+            let area = f.area();
+            f.render_widget(message(text, DIM, panel()), area);
+        })
+        .unwrap();
+        rows_of(&t)
+    }
+
+    const MERGE_NOTE: &str = "merge commit: git log reports no per-file stats for merges (Enter shows the commit)";
+
+    #[test]
+    fn message_that_fits_stays_on_one_line_one_cell_from_the_border() {
+        let screen = draw_message(30, 4, "working tree clean");
+        assert_eq!(screen[1], format!("│ working tree clean{}│", " ".repeat(9)));
+        assert_eq!(screen[2], format!("│{}│", " ".repeat(28)));
+    }
+
+    #[test]
+    fn long_message_wraps_instead_of_losing_its_end() {
+        for width in 14..=100u16 {
+            let screen = draw_message(width, 20, MERGE_NOTE);
+            let inside: Vec<&str> = screen[1..19].iter().map(|r| &r[r.find('│').unwrap() + '│'.len_utf8()..]).collect();
+            let text = inside.join(" ");
+            for word in MERGE_NOTE.split(' ') {
+                assert!(text.contains(word), "width {width}: {word} is missing from {inside:?}");
+            }
+            // Every line keeps its distance from both borders.
+            for row in inside {
+                assert!(row.starts_with(' '), "width {width}: {row:?}");
+                assert!(row.ends_with(" │"), "width {width}: {row:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn long_error_without_spaces_and_cjk_text_wrap_too() {
+        let path = "fatal:/a/very/long/path/without/any/spaces/in/it";
+        let joined: String = draw_message(20, 8, path)[1..7]
+            .iter()
+            .map(|r| r.trim_matches(|c| c == '│' || c == ' '))
+            .collect();
+        assert_eq!(joined, path);
+        let cjk = "这是一条很长的中文提示信息应该换行显示";
+        // A wide character leaves a blank cell behind it in the buffer.
+        let joined: String = draw_message(14, 8, cjk).join("").chars().filter(|c| !" │╭╮╰╯─".contains(*c)).collect();
+        assert_eq!(joined, cjk);
+    }
+
+    #[test]
+    fn every_line_of_a_multi_line_error_shows() {
+        let screen = draw_message(40, 5, "fatal: one\nhint: two");
+        assert!(screen[1].contains("fatal: one"), "{}", screen[1]);
+        assert!(screen[2].contains("hint: two"), "{}", screen[2]);
+    }
+
+    #[test]
+    fn tiny_messages_do_not_panic() {
+        for width in 1..30 {
+            for height in 1..6 {
+                draw_message(width, height, MERGE_NOTE);
+                draw_message(width, height, "陈志民陈志民");
+                draw_message(width, height, "");
+            }
+        }
     }
 
     #[test]
