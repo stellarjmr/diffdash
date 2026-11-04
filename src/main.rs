@@ -39,6 +39,10 @@ const BRANCH_MARK: usize = 3;
 /// Branch list: below this many cells of name, marker included, the counts other
 /// than `+` and `-` go too.
 const NAME_FLOOR: usize = 16;
+/// Top bar: cells between the repo and branch names.
+const TOP_GAP: usize = 2;
+/// Top bar: a name cut shorter than this says too little.
+const NAME_MIN: usize = 6;
 /// Stats: what the key column takes at least while there is room to spare, for
 /// days and for names (directories and authors).
 const DAY_KEY: usize = 11;
@@ -291,6 +295,66 @@ fn fit_path(f: &FileStat, width: usize) -> String {
 
 fn repo_name(root: &Path) -> String {
     root.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// Repo and branch name in `room` cells. Each keeps what it needs up to half of
+/// the room and the other takes the rest. With too little room for two names only
+/// the branch stays, because it is the one that changes, and a stub says nothing.
+fn fit_names(room: usize, repo: &str, branch: &str) -> (String, String) {
+    let (r, b) = (cells(repo), cells(branch));
+    if r + TOP_GAP + b <= room {
+        return (repo.to_string(), branch.to_string());
+    }
+    if room < TOP_GAP + 2 * NAME_MIN {
+        let keep = b <= room || room >= NAME_MIN;
+        return (String::new(), if keep { shorten_path(branch, room) } else { String::new() });
+    }
+    let room = room - TOP_GAP;
+    let r = r.min(room - b.min(room / 2));
+    (clip(repo, r), shorten_path(branch, room - r))
+}
+
+/// The line in the top bar of a box `area_w` wide. All four tabs always fit, so the
+/// active one can always be seen. The badge goes first, because it says the least.
+/// Then the tabs show only their numbers: those are the keys, nothing moves when the
+/// active tab changes, and the panel below names it. Then the names get shorter.
+fn top_line(area_w: u16, repo: &str, branch: &str, tab: usize) -> Line<'static> {
+    const BADGE: &str = " diffdash ";
+    let label = |i: usize, words: bool| {
+        if words { format!(" {} {} ", i + 1, TABS[i]) } else { format!(" {} ", i + 1) }
+    };
+    let inner = (area_w as usize).saturating_sub(2);
+    // Beside the names: the leading space, the badge with its caps and space, the
+    // gap before the tabs, and the tabs with the caps of a pill or the spaces of a slot.
+    let room = |badge: bool, words: bool| {
+        let badge = if badge { cells(BADGE) + 3 } else { 0 };
+        let tabs: usize = (0..TABS.len()).map(|i| cells(&label(i, words)) + 2).sum();
+        inner.saturating_sub(1 + badge + 3 + tabs)
+    };
+    let whole = cells(repo) + TOP_GAP + cells(branch);
+    let badge = whole <= room(true, true);
+    let words = whole <= room(false, true);
+    let (repo, branch) = fit_names(room(badge, words), repo, branch);
+
+    // Leading space so the pill cap does not touch the border.
+    let mut spans = vec![Span::raw(" ")];
+    if badge {
+        spans.extend(pill(BADGE, Some(ACCENT)));
+        spans.push(Span::raw(" "));
+    }
+    let gap = if repo.is_empty() { "" } else { "  " };
+    spans.push(Span::styled(repo, Style::new().bold()));
+    if !branch.is_empty() {
+        spans.push(Span::styled(format!("{gap}{branch}   "), Style::new().fg(Color::Magenta)));
+    }
+    for i in 0..TABS.len() {
+        if i == tab {
+            spans.extend(pill(label(i, words), None));
+        } else {
+            spans.extend(pill_slot(label(i, words), Style::new().fg(DIM)));
+        }
+    }
+    Line::from(spans)
 }
 
 // ---------------------------------------------------------------- --once
@@ -808,21 +872,8 @@ impl App {
 
     fn render_top(&self, f: &mut Frame, area: Rect) {
         let branch = self.work.as_ref().map_or("…", |w| w.branch.as_str());
-        // Leading space so the pill cap does not touch the border.
-        let mut spans = vec![Span::raw(" ")];
-        spans.extend(pill(" diffdash ", Some(ACCENT)));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(repo_name(&self.repo.root), Style::new().bold()));
-        spans.push(Span::styled(format!("  {branch}   "), Style::new().fg(Color::Magenta)));
-        for (i, t) in TABS.iter().enumerate() {
-            let label = format!(" {} {t} ", i + 1);
-            if i == self.tab {
-                spans.extend(pill(label, None));
-            } else {
-                spans.extend(pill_slot(label, Style::new().fg(DIM)));
-            }
-        }
-        f.render_widget(Paragraph::new(Line::from(spans)).block(panel()), area);
+        let line = top_line(area.width, &repo_name(&self.repo.root), branch, self.tab);
+        f.render_widget(Paragraph::new(line).block(panel()), area);
     }
 
     fn render_bottom(&self, f: &mut Frame, area: Rect) {
@@ -2271,6 +2322,122 @@ mod tests {
                     draw_stats(f, area, &empty, 1, &mut state);
                 })
                 .unwrap();
+            }
+        }
+    }
+
+    /// The top bar as it was built before it had to fit.
+    fn full_top(repo: &str, branch: &str, tab: usize) -> String {
+        let mut text = format!(" {PILL_L} diffdash {PILL_R} {repo}  {branch}   ");
+        for (i, t) in TABS.iter().enumerate() {
+            let (l, r) = if i == tab { (PILL_L, PILL_R) } else { (" ", " ") };
+            text += &format!("{l} {} {t} {r}", i + 1);
+        }
+        text
+    }
+
+    fn top_text(width: u16, repo: &str, branch: &str, tab: usize) -> String {
+        top_line(width, repo, branch, tab).iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// The row inside the top bar, and the text of its reversed cells.
+    fn draw_top(width: u16, repo: &str, branch: &str, tab: usize) -> (String, String) {
+        let mut t = Terminal::new(TestBackend::new(width, 3)).unwrap();
+        t.draw(|f| {
+            let area = f.area();
+            f.render_widget(Paragraph::new(top_line(width, repo, branch, tab)).block(panel()), area);
+        })
+        .unwrap();
+        let b = t.backend().buffer();
+        let row = (0..width).map(|x| b[(x, 1)].symbol()).collect();
+        let reversed = (0..width)
+            .filter(|x| b[(*x, 1)].modifier.contains(Modifier::REVERSED))
+            .map(|x| b[(x, 1)].symbol())
+            .collect();
+        (row, reversed)
+    }
+
+    #[test]
+    fn top_bar_stays_as_it_was_while_everything_fits() {
+        // The width the rules for this bar have always been checked at.
+        for tab in 0..TABS.len() {
+            assert_eq!(top_text(80, "diffdash", "main", tab), full_top("diffdash", "main", tab), "tab {tab}");
+            assert_eq!(top_text(200, "repo", "agent/feature", tab), full_top("repo", "agent/feature", tab), "tab {tab}");
+        }
+        assert_eq!(cells(&top_text(80, "diffdash", "main", 0)), 78);
+    }
+
+    #[test]
+    fn top_bar_gives_up_badge_then_tab_names_then_repo_and_branch() {
+        let (repo, branch) = ("demo", "main");
+        let has = |width, text: &str| top_text(width, repo, branch, 2).contains(text);
+        // The badge goes when names and all the tab names would not fit beside it.
+        assert!(has(76, "diffdash") && has(76, "Branches"));
+        assert!(!has(75, "diffdash") && has(75, "Branches"));
+        // The tab names go next.
+        assert!(has(63, "Branches"));
+        assert!(!has(62, "diffdash") && !has(62, "Stats") && !has(62, "Branches") && has(62, "demo  main"));
+        // Then the names.
+        assert!(has(36, "demo  main"));
+        assert!(!has(35, "demo") && has(35, "main"));
+        assert!(has(30, "main"));
+        assert!(!has(29, "main"));
+    }
+
+    #[test]
+    fn all_tabs_and_the_active_one_show_at_every_width() {
+        let names = [("demo", "main"), ("diffdash", "narrow-panes"), ("demo", LONG_BRANCH), (&"r".repeat(70), LONG_BRANCH)];
+        for (repo, branch) in names {
+            for tab in 0..TABS.len() {
+                for width in 23..=200u16 {
+                    let (row, reversed) = draw_top(width, repo, branch, tab);
+                    for number in ["1", "2", "3", "4"] {
+                        assert!(row.contains(number), "width {width} tab {tab}: {row}");
+                    }
+                    assert!(reversed.contains(&(tab + 1).to_string()), "width {width} tab {tab}: {row}");
+                    // Everything fits, so the last cap or slot is inside the border.
+                    assert!(cells(&top_text(width, repo, branch, tab)) <= width as usize - 2, "width {width}: {row}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tabs_do_not_move_when_they_show_only_numbers() {
+        let starts: Vec<usize> = (0..TABS.len())
+            .map(|tab| {
+                let text = top_text(40, "demo", "main", tab);
+                text.chars().position(|c| c == '1').unwrap()
+            })
+            .collect();
+        assert!(starts.windows(2).all(|w| w[0] == w[1]), "{starts:?}");
+    }
+
+    #[test]
+    fn repo_and_branch_share_the_top_bar() {
+        // Both whole.
+        assert_eq!(fit_names(11, "demo2", "main"), ("demo2".to_string(), "main".to_string()));
+        // Neither fits in half: each gets half.
+        let long = "agent/fix-the-narrow-panes";
+        assert_eq!(fit_names(22, "a-repository-name", long), ("a-reposit…".to_string(), "…row-panes".to_string()));
+        // A short name leaves the rest to the other, in either direction.
+        assert_eq!(fit_names(22, "demo", long), ("demo".to_string(), shorten_path(long, 16)));
+        assert_eq!(fit_names(16, "a-long-repository", "main"), ("a-long-re…".to_string(), "main".to_string()));
+        // With too little room for two names, only the branch stays.
+        assert_eq!(fit_names(13, "repository", "main"), (String::new(), "main".to_string()));
+        assert_eq!(fit_names(6, "repo", long), (String::new(), shorten_path(long, 6)));
+        // A stub says nothing.
+        assert_eq!(fit_names(5, "repo", long), (String::new(), String::new()));
+        assert_eq!(fit_names(4, "repo", "main"), (String::new(), "main".to_string()));
+        assert_eq!(fit_names(0, "repo", "main"), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn tiny_top_bars_do_not_panic() {
+        for width in 0..23 {
+            for tab in 0..TABS.len() {
+                draw_top(width.max(1), "demo", LONG_BRANCH, tab);
+                top_line(width, "", "", tab);
             }
         }
     }
