@@ -4,6 +4,8 @@ All notable changes to `diffdash` are tracked here.
 
 ## Unreleased
 
+## 0.3.1 - 2026-11-06
+
 - Fix: the Stats heatmap drew tall rectangles and filled only part of the row. Below 113 columns a day was one cell wide, and a terminal cell is about twice as high as it is wide, while the year took 58 of the 106 cells in a 108-column window. Wider windows stopped at 111 cells. A day is now always two cells wide, which makes about a square. A window under 114 columns shows fewer weeks instead, without the oldest (50 weeks at 108 columns, 26 at 60), and the title says how many. A wider window puts the extra columns between the months, so the map reaches the edge at any width. The weeks of a month keep touching, because with gaps between columns and none between rows, a stack of equal days reads as one tall bar. The key on the bottom border uses the same squares. `--once` is unchanged: it does not fit its output to a width, and a year of squares would wrap in any terminal under 112 columns.
 
 ## 0.3.0 - 2026-11-05
