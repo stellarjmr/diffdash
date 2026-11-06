@@ -4,6 +4,8 @@ All notable changes to `diffdash` are tracked here.
 
 ## Unreleased
 
+## 0.3.0 - 2026-11-05
+
 - The Stats tab now has a GitHub-style heatmap above its tables: one cell per day for the last 53 weeks, shaded by lines added plus deleted. By day has the same numbers, but as a list limited to the range, so a year's rhythm could not be seen at a glance. The map ignores `t`, and otherwise counts what the rest of Stats counts: commits on HEAD, without merges, by commit date. The shade is in the glyph (`░ ▒ ▓ █`, and `·` for a day with no commits), because the UI uses only the terminal's palette colors, so it follows light and dark themes. Each shade holds a quarter of the days with commits, so one huge commit does not leave the other days looking empty. The day selected in By day is marked on the map. It takes 10 rows, so the tables get shorter, and a terminal under 29 rows leaves it out and looks as before. A day is two cells wide from 113 columns and one below that; below 60 columns the oldest weeks go. `--once` prints the map too. It reloads when HEAD moves, on a background job that reads a year of `git log --numstat`: about 1 s on a repo with 940 commits that year.
 
 ## 0.2.2 - 2026-11-04

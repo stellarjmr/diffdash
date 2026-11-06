@@ -1,6 +1,6 @@
 [package]
 name = "diffdash"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 description = "Read-only TUI dashboard for lines added and deleted in a git repository"
 license = "MIT"
