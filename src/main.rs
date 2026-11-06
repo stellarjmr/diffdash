@@ -57,6 +57,9 @@ const BUCKET_BAR: usize = 4;
 const HEAT_WEEKS: usize = 53;
 /// Stats: cells before the first week of the heatmap, for the day names.
 const HEAT_LABEL: usize = 5;
+/// Stats: cells a day takes on the heatmap. A terminal's cell is about half as wide as
+/// it is high, so two side by side in one row make a square.
+const HEAT_DAY: usize = 2;
 /// Stats: rows of the heatmap in its box: months, seven days and two borders.
 const HEAT_H: u16 = 10;
 /// Stats: rows the tables keep below the heatmap, or it stays away.
@@ -470,7 +473,9 @@ fn print_once(repo: &Repo, o: &Opts) -> Result<(), String> {
     );
     let (c, a, d) = heat_totals(&map, HEAT_WEEKS);
     out += &format!("Lines changed per day, last {HEAT_WEEKS} weeks  {c} commits  {} {}\n", plus(a), minus(d));
-    for line in heat_lines(&map, 1, HEAT_WEEKS, None) {
+    // One cell a day: nothing here is fitted to a width, and a year of squares would
+    // wrap in any terminal under 112 columns.
+    for line in heat_lines(&map, 1, HEAT_WEEKS, 0, None) {
         out += &format!(" {}\n", line.to_string().trim_end());
     }
     for (title, list, limit) in
@@ -1664,13 +1669,30 @@ fn load_heatmap(repo: &Repo) -> Result<Heatmap, String> {
     Ok(Heatmap::new(today(), stats.by_day))
 }
 
-/// Cells per week and the number of weeks in a panel `area_w` wide: a year in cells
-/// about as wide as they are high, then a year in single cells, then fewer weeks.
-/// The oldest go, because the newest say the most.
+/// The weeks in a panel `area_w` wide, and the cells left over once a whole year is
+/// in. A day keeps its square shape, so a pane too narrow for the year shows fewer
+/// weeks. The oldest go, because the newest say the most.
 fn heat_fit(area_w: u16) -> (usize, usize) {
-    let room = (area_w as usize).saturating_sub(2 + HEAT_LABEL);
-    let cell = if room >= 2 * HEAT_WEEKS { 2 } else { 1 };
-    (cell, (room / cell).min(HEAT_WEEKS))
+    // The borders, the day names and a blank cell before the right border.
+    let room = (area_w as usize).saturating_sub(3 + HEAT_LABEL);
+    ((room / HEAT_DAY).min(HEAT_WEEKS), room.saturating_sub(HEAT_DAY * HEAT_WEEKS))
+}
+
+/// Where each week starts, counted from the first week. `spare` cells go between
+/// months, so a wide pane is filled. They do not go between weeks: days stay squares
+/// only while they touch, since a gap beside a column and none above it makes a stack
+/// of equal days read as one tall bar.
+fn heat_columns(first: i32, weeks: usize, cell: usize, spare: usize) -> Vec<usize> {
+    let month = |w: usize| month_of(first + 7 * w as i32);
+    let starts_month = |w: &usize| *w > 0 && month(*w) != month(*w - 1);
+    let months = (0..weeks).filter(starts_month).count().max(1);
+    let mut seen = 0;
+    (0..weeks)
+        .map(|w| {
+            seen += usize::from(starts_month(&w));
+            w * cell + seen * spare / months
+        })
+        .collect()
 }
 
 /// The Sunday that starts the map: the last week holds today, like on GitHub.
@@ -1688,13 +1710,14 @@ fn heat_totals(map: &Heatmap, weeks: usize) -> (u64, u64, u64) {
 /// The row over the weeks. A month's name stands over the first week that starts in
 /// it. A name goes if it would touch the next one, which only the month the map
 /// starts in can do, or if it would run past the last week.
-fn heat_months(first: i32, weeks: usize, cell: usize) -> String {
+fn heat_months(first: i32, columns: &[usize], cell: usize) -> String {
     let month = |w: usize| month_of(first + 7 * w as i32);
-    let starts: Vec<usize> = (0..weeks).filter(|&w| w == 0 || month(w) != month(w - 1)).collect();
+    let starts: Vec<usize> = (0..columns.len()).filter(|&w| w == 0 || month(w) != month(w - 1)).collect();
     let mut text = " ".repeat(HEAT_LABEL);
     for (i, &w) in starts.iter().enumerate() {
-        let col = HEAT_LABEL + w * cell;
-        let end = starts.get(i + 1).map_or(HEAT_LABEL + weeks * cell, |next| HEAT_LABEL + next * cell - 1);
+        let col = HEAT_LABEL + columns[w];
+        let last = HEAT_LABEL + columns[columns.len() - 1] + cell;
+        let end = starts.get(i + 1).map_or(last, |&next| HEAT_LABEL + columns[next] - 1);
         if col + cells(MONTHS[month(w)]) <= end {
             text = pad(&text, col) + MONTHS[month(w)];
         }
@@ -1718,12 +1741,18 @@ fn heat_cell(map: &Heatmap, day: i32, cell: usize, selected: Option<i32>) -> Spa
 }
 
 /// The month row and the seven day rows, Sunday first.
-fn heat_lines(map: &Heatmap, cell: usize, weeks: usize, selected: Option<i32>) -> Vec<Line<'static>> {
+fn heat_lines(map: &Heatmap, cell: usize, weeks: usize, spare: usize, selected: Option<i32>) -> Vec<Line<'static>> {
     let first = heat_first(map.today, weeks);
-    let mut lines = vec![Line::from(heat_months(first, weeks, cell)).fg(DIM)];
+    let columns = heat_columns(first, weeks, cell, spare);
+    let mut lines = vec![Line::from(heat_months(first, &columns, cell)).fg(DIM)];
     for (row, name) in ["", "Mon", "", "Wed", "", "Fri", ""].iter().enumerate() {
         let mut spans = vec![Span::styled(format!(" {name:<3} "), Style::new().fg(DIM))];
-        spans.extend((0..weeks).map(|w| heat_cell(map, first + (7 * w + row) as i32, cell, selected)));
+        let mut end = 0;
+        for (w, &x) in columns.iter().enumerate() {
+            spans.push(Span::raw(" ".repeat(x - end)));
+            spans.push(heat_cell(map, first + (7 * w + row) as i32, cell, selected));
+            end = x + cell;
+        }
         lines.push(Line::from(spans));
     }
     lines
@@ -1748,7 +1777,7 @@ fn heat_title(map: &Heatmap, weeks: usize, area_w: u16) -> Line<'static> {
 /// The key to the levels, on the bottom border.
 fn heat_legend(area_w: u16) -> Line<'static> {
     let dim = Style::new().fg(DIM);
-    let ramp = HEAT_GLYPHS[1..].concat();
+    let ramp = HEAT_GLYPHS[1..].iter().map(|g| g.repeat(HEAT_DAY)).collect::<String>();
     let key = vec![
         Span::styled(format!(" less {} ", HEAT_GLYPHS[0]), dim),
         Span::styled(ramp, Style::new().fg(ADD)),
@@ -1758,9 +1787,9 @@ fn heat_legend(area_w: u16) -> Line<'static> {
 }
 
 fn heat_panel(map: &Heatmap, area_w: u16, selected: Option<i32>) -> Paragraph<'static> {
-    let (cell, weeks) = heat_fit(area_w);
+    let (weeks, spare) = heat_fit(area_w);
     let block = panel().title(heat_title(map, weeks, area_w)).title_bottom(heat_legend(area_w));
-    Paragraph::new(heat_lines(map, cell, weeks, selected)).block(block)
+    Paragraph::new(heat_lines(map, HEAT_DAY, weeks, spare, selected)).block(block)
 }
 
 /// A day that does not fit loses its year first: `11-01`.
@@ -2677,7 +2706,7 @@ mod tests {
 
     /// The map's rows as cells, with the month row first and Sunday second.
     fn map_rows(map: &Heatmap, cell: usize, weeks: usize) -> Vec<Vec<char>> {
-        heat_lines(map, cell, weeks, None).iter().map(|l| l.to_string().chars().collect()).collect()
+        heat_lines(map, cell, weeks, 0, None).iter().map(|l| l.to_string().chars().collect()).collect()
     }
 
     fn draw_map(width: u16, map: &Heatmap, selected: Option<i32>) -> Terminal<TestBackend> {
@@ -2749,20 +2778,61 @@ mod tests {
     }
 
     #[test]
-    fn heatmap_keeps_a_year_and_then_loses_its_oldest_weeks() {
+    fn heatmap_keeps_its_squares_and_a_narrow_pane_loses_the_oldest_weeks() {
         for (width, fit) in [
-            (300, (2, 53)),
-            (125, (2, 53)),
-            (113, (2, 53)),
-            // The whole year in single cells.
-            (112, (1, 53)),
-            (60, (1, 53)),
-            (59, (1, 52)),
-            (40, (1, 33)),
-            (7, (1, 0)),
-            (0, (1, 0)),
+            (300, (53, 186)),
+            (125, (53, 11)),
+            (114, (53, 0)),
+            (113, (52, 0)),
+            (108, (50, 0)),
+            (60, (26, 0)),
+            (40, (16, 0)),
+            (10, (1, 0)),
+            (9, (0, 0)),
+            (0, (0, 0)),
         ] {
             assert_eq!(heat_fit(width), fit, "width {width}");
+        }
+    }
+
+    #[test]
+    fn heatmap_spare_cells_go_between_months_and_reach_the_end() {
+        for today in day("2026-01-01")..day("2027-01-01") {
+            for spare in [0, 1, 11, 12, 13, 51, 186] {
+                let first = heat_first(today, HEAT_WEEKS);
+                let columns = heat_columns(first, HEAT_WEEKS, HEAT_DAY, spare);
+                assert_eq!(columns[0], 0);
+                assert_eq!(columns[HEAT_WEEKS - 1], (HEAT_WEEKS - 1) * HEAT_DAY + spare, "{today} {spare}");
+                let starts_month = |w: usize| month_of(first + 7 * w as i32) != month_of(first + 7 * (w as i32 - 1));
+                let gap = |w: usize| columns[w] - columns[w - 1] - HEAT_DAY;
+                let between: Vec<usize> = (1..HEAT_WEEKS).filter(|&w| starts_month(w)).map(gap).collect();
+                // Weeks of one month touch, and the gaps between months differ by at most a cell.
+                assert!((1..HEAT_WEEKS).all(|w| starts_month(w) || gap(w) == 0), "{today} {spare}");
+                let (least, most) = (between.iter().min().unwrap(), between.iter().max().unwrap());
+                assert!(most - least <= 1, "{today} {spare}: {between:?}");
+            }
+        }
+    }
+
+    /// The Sunday row of a panel `width` wide, with a commit on every day so all of them show.
+    fn sundays(width: u16) -> Vec<char> {
+        let today = day(MAP_TODAY);
+        let days = (today - 400..=today).map(|d| (d, (4, bucket("", 1, 1, 0)))).collect();
+        let map = Heatmap { today, days };
+        rows_of(&draw_map(width, &map, None))[2].chars().collect()
+    }
+
+    #[test]
+    fn heatmap_fills_the_pane_in_squares_at_any_width() {
+        for width in 10..=320u16 {
+            let row = sundays(width);
+            let last = row.iter().rposition(|c| *c == '█').unwrap();
+            // One blank cell before the border, or two if a whole day would not fit.
+            let blank = width as usize - 2 - last;
+            let most = if width >= 114 || width % 2 == 0 { 1 } else { 2 };
+            assert_eq!(blank, most, "width {width}");
+            let (weeks, _) = heat_fit(width);
+            assert_eq!(row.iter().filter(|c| **c == '█').count(), weeks * HEAT_DAY, "width {width}");
         }
     }
 
@@ -2790,9 +2860,9 @@ mod tests {
             assert_eq!(rows[row][..HEAT_LABEL].iter().collect::<String>(), name);
         }
 
-        // A day is two cells wide when there is room for that.
-        let rows = map_rows(&map, 2, HEAT_WEEKS);
-        let at = HEAT_LABEL + 2 * last;
+        // In the panel a day is two cells wide, and a day with no commits has one dot.
+        let rows = map_rows(&map, HEAT_DAY, HEAT_WEEKS);
+        let at = HEAT_LABEL + HEAT_DAY * last;
         assert_eq!(rows[5][at..at + 2], ['█', '█']);
         assert_eq!(rows[2][at..at + 2], ['·', ' ']);
         assert_eq!(rows[6][at..at + 2], [' ', ' ']);
@@ -2800,7 +2870,10 @@ mod tests {
 
     #[test]
     fn month_names_stand_over_the_first_week_that_starts_in_them() {
-        let months = |weeks| heat_months(heat_first(day(MAP_TODAY), weeks), weeks, 1);
+        let months = |weeks| {
+            let first = heat_first(day(MAP_TODAY), weeks);
+            heat_months(first, &heat_columns(first, weeks, 1, 0), 1)
+        };
         assert_eq!(months(53), "     Nov  Dec Jan Feb Mar  Apr May  Jun Jul Aug  Sep Oct");
         // March starts this map too, but April would touch its name.
         assert_eq!(months(33), "       Apr May  Jun Jul Aug  Sep Oct");
@@ -2810,18 +2883,38 @@ mod tests {
 
     #[test]
     fn month_names_are_never_cut_and_never_touch() {
+        let sizes = [
+            (1, 1, 0),
+            (1, 2, 0),
+            (1, 3, 0),
+            (1, 4, 0),
+            (1, 5, 0),
+            (1, 33, 0),
+            (1, HEAT_WEEKS, 0),
+            (HEAT_DAY, 1, 0),
+            (HEAT_DAY, 2, 0),
+            (HEAT_DAY, 3, 0),
+            (HEAT_DAY, 16, 0),
+            (HEAT_DAY, 26, 0),
+            (HEAT_DAY, 50, 0),
+            (HEAT_DAY, HEAT_WEEKS, 0),
+            (HEAT_DAY, HEAT_WEEKS, 11),
+            (HEAT_DAY, HEAT_WEEKS, 186),
+        ];
         for today in day("2026-01-01")..day("2027-01-01") {
-            for (cell, weeks) in [(1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 33), (1, HEAT_WEEKS), (2, HEAT_WEEKS)] {
+            for (cell, weeks, spare) in sizes {
                 let first = heat_first(today, weeks);
-                let text = heat_months(first, weeks, cell);
-                assert!(cells(&text) <= HEAT_LABEL + weeks * cell, "{today} {cell} {weeks}: {text}");
+                let columns = heat_columns(first, weeks, cell, spare);
+                let text = heat_months(first, &columns, cell);
+                let id = format!("{today} {cell} {weeks} {spare}: {text}");
+                assert!(cells(&text) <= HEAT_LABEL + columns[weeks - 1] + cell, "{id}");
                 let mut from = 0;
                 for name in text.split_whitespace() {
                     let at = from + text[from..].find(name).unwrap();
                     from = at + name.len();
-                    let week = ((at - HEAT_LABEL) / cell) as i32;
-                    assert_eq!(MONTHS[month_of(first + 7 * week)], name, "{today} {cell} {weeks}: {text}");
-                    assert!(week == 0 || month_of(first + 7 * (week - 1)) != month_of(first + 7 * week));
+                    let week = columns.iter().position(|x| HEAT_LABEL + x == at).expect(&id) as i32;
+                    assert_eq!(MONTHS[month_of(first + 7 * week)], name, "{id}");
+                    assert!(week == 0 || month_of(first + 7 * (week - 1)) != month_of(first + 7 * week), "{id}");
                 }
             }
         }
@@ -2852,8 +2945,8 @@ mod tests {
             assert_eq!(title.contains("12 commits"), width >= 69, "width {width}: {title}");
             assert_eq!(title.contains("Lines changed"), width >= 48, "width {width}: {title}");
             assert_eq!(title.contains("+123456"), width >= 32, "width {width}: {title}");
-            assert_eq!(foot.contains("less · ░▒▓█ more"), width >= 20, "width {width}: {foot}");
-            assert_eq!(foot.contains("less"), width >= 20, "width {width}: {foot}");
+            assert_eq!(foot.contains("less · ░░▒▒▓▓██ more"), width >= 24, "width {width}: {foot}");
+            assert_eq!(foot.contains("less"), width >= 24, "width {width}: {foot}");
         }
     }
 
@@ -2861,7 +2954,8 @@ mod tests {
     fn selected_day_is_reversed_on_the_map() {
         let map = map_of(vec![bucket("2026-11-02", 1, 5, 0), bucket("2026-10-26", 1, 5, 0)]);
         for width in [125u16, 80, 60, 40] {
-            let (cell, weeks) = heat_fit(width);
+            let (weeks, spare) = heat_fit(width);
+            let columns = heat_columns(heat_first(day(MAP_TODAY), weeks), weeks, HEAT_DAY, spare);
             let t = draw_map(width, &map, Some(day("2026-11-02")));
             let b = t.backend().buffer();
             let reversed: Vec<(u16, u16)> = (0..HEAT_H)
@@ -2869,8 +2963,8 @@ mod tests {
                 .filter(|&(x, y)| b[(x, y)].modifier.contains(Modifier::REVERSED))
                 .collect();
             // Inside the border and below the months: a Monday, in the last week.
-            let x = (1 + HEAT_LABEL + (weeks - 1) * cell) as u16;
-            let want: Vec<(u16, u16)> = (x..x + cell as u16).map(|x| (x, 3)).collect();
+            let x = (1 + HEAT_LABEL + columns[weeks - 1]) as u16;
+            let want: Vec<(u16, u16)> = (x..x + HEAT_DAY as u16).map(|x| (x, 3)).collect();
             assert_eq!(reversed, want, "width {width}");
         }
         // A day off the map marks nothing.
@@ -2903,7 +2997,7 @@ mod tests {
     fn tiny_heatmaps_do_not_panic() {
         let s = sample_stats();
         let (full, empty) = (map_of(s.by_day.clone()), map_of(Vec::new()));
-        for width in 1..130u16 {
+        for width in 1..320u16 {
             for height in [1u16, 5, 10, 22, 23, 30] {
                 let mut t = Terminal::new(TestBackend::new(width, height)).unwrap();
                 let mut state = TableState::default().with_selected(Some(0));
