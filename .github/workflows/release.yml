@@ -11,7 +11,7 @@ permissions:
 jobs:
   macos-arm64:
     name: Build macOS Apple Silicon binary
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
       - name: Check out repository
