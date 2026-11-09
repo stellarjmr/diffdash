@@ -4,6 +4,8 @@ All notable changes to `diffdash` are tracked here.
 
 ## Unreleased
 
+## 0.4.0 - 2026-11-09
+
 - Mouse support. A click on a tab switches to it, on a row of a list selects it, on a range pill in Stats picks that range, and on a day of the heatmap selects that day in By day (a day with no commits in the range has no row there, so nothing happens). Section headers and rows of graph lines cannot be selected, as with the keys. A double click on a row opens it in less, like Enter; a single click never does, since less takes over the screen. The wheel moves the selection like `j` and `k`. It has to: with mouse reports on, the terminal sends the wheel to diffdash instead of turning it into arrow keys, which is how the wheel moved the selection before in terminals like Ghostty. diffdash asks only for presses, releases and the wheel, because reports of pointer motion would cost a redraw for every cell the pointer crosses. A double click opens on the release of its second press, not on the press: a release reported once less had started would reach less as keys. Mouse reports are off while less runs, so its wheel works as before, and when diffdash exits, also after a panic, so the shell never prints clicks. While diffdash runs, selecting text in the terminal needs a modifier held as you drag, Shift in Ghostty.
 
 ## 0.3.1 - 2026-11-06
