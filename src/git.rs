@@ -211,7 +211,7 @@ impl Repo {
         Ok(Repo::at(PathBuf::from(root)))
     }
 
-    fn at(root: PathBuf) -> Repo {
+    pub(crate) fn at(root: PathBuf) -> Repo {
         Repo {
             root,
             untracked_cache: Mutex::new(HashMap::new()),

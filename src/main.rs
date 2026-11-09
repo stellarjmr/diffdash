@@ -2,6 +2,7 @@ mod git;
 
 use std::collections::HashMap;
 use std::io::{self, Write as _};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -9,12 +10,14 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::crossterm::{cursor, execute};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Cell, Padding, Paragraph, Row, Table, TableState, Wrap};
@@ -24,6 +27,8 @@ use git::{Branch, BranchCmp, Branches, Bucket, Commit, FileStat, GraphRow, Log, 
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const REFRESH: Duration = Duration::from_secs(2);
+/// Two presses on the same row within this long are a double click, which opens it.
+const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 const BAR: usize = 24;
 /// Number columns of a file list when there is room to spare.
 const NUM_W: usize = 8;
@@ -160,7 +165,12 @@ Keys:
   Enter             open the diff of the selected file, commit or branch in less
   t                 cycle Stats range
   r                 refresh now
-  q / Esc           quit"
+  q / Esc           quit
+
+Mouse:
+  click             switch tab, select a row, a Stats range or a heatmap day
+  double-click      open the row in less, like Enter
+  wheel             move, like j k"
     )
 }
 
@@ -378,6 +388,7 @@ fn top_line(area_w: u16, repo: &str, branch: &str, tab: usize) -> Line<'static> 
     if !branch.is_empty() {
         spans.push(Span::styled(format!("{gap}{branch}   "), Style::new().fg(Color::Magenta)));
     }
+    // Last, so that clicks find them: see `tab_cells`.
     for i in 0..TABS.len() {
         if i == tab {
             spans.extend(pill(label(i, words), None));
@@ -386,6 +397,31 @@ fn top_line(area_w: u16, repo: &str, branch: &str, tab: usize) -> Line<'static> 
         }
     }
     Line::from(spans)
+}
+
+/// Where the `count` pills from span `first` of `line` are, in cells from its start.
+/// A pill is three spans, from [`pill`] or [`pill_slot`].
+fn pill_cells(line: &Line, first: usize, count: usize) -> Vec<Range<usize>> {
+    let mut edges = vec![0];
+    for span in &line.spans {
+        edges.push(edges[edges.len() - 1] + span.width());
+    }
+    (0..count).map(|i| edges[first + 3 * i]..edges[first + 3 * i + 3]).collect()
+}
+
+/// Where each tab is on a line from [`top_line`], which ends with them.
+fn tab_cells(line: &Line) -> Vec<Range<usize>> {
+    pill_cells(line, line.spans.len() - 3 * TABS.len(), TABS.len())
+}
+
+/// The cells `x` of the first row of `area`, as far as the area goes.
+fn row_cells(area: Rect, x: Range<usize>) -> Rect {
+    Rect::new(area.x.saturating_add(x.start as u16), area.y, x.len() as u16, 1).intersection(area)
+}
+
+/// The rows a list in a box at `area` shows, from row `offset` of the list on.
+fn row_targets(area: Rect, offset: usize, len: usize) -> impl Iterator<Item = (Rect, Target)> {
+    area.inner(Margin::new(1, 1)).rows().zip(offset..len).map(|(row, i)| (row, Target::Row(i)))
 }
 
 /// The line in the bottom bar of a box `area_w` wide. What is going on comes before
@@ -556,6 +592,19 @@ enum WorkRow {
     File { kind: Kind, file: FileStat },
 }
 
+/// What a left click does where it lands. Drawing records where each one is, so a
+/// click acts on what the screen shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Target {
+    Tab(usize),
+    /// A row of the current tab's list, counted from its first row.
+    Row(usize),
+    /// A Stats range pill.
+    Range(usize),
+    /// A day on the heatmap, as a day number.
+    Day(i32),
+}
+
 struct App {
     repo: Arc<Repo>,
     tx: Sender<Msg>,
@@ -585,6 +634,12 @@ struct App {
     /// Last error per source (WORK, LOG, STATS, BRANCHES, HEAT, PAGER); cleared by
     /// that source's next success, so one source never hides another's failure.
     errors: [Option<String>; 6],
+    /// Where the last frame drew each thing a click can act on.
+    targets: Vec<(Rect, Target)>,
+    /// When the last press on a row was, with its tab and row, for a double click.
+    last_click: Option<(Instant, usize, usize)>,
+    /// A double click opens its row when the button comes up.
+    open_on_release: bool,
     quit: bool,
 }
 
@@ -624,6 +679,9 @@ impl App {
             last_tips: None,
             last_work: Instant::now(),
             errors: Default::default(),
+            targets: Vec::new(),
+            last_click: None,
+            open_on_release: false,
             quit: false,
         }
     }
@@ -866,6 +924,40 @@ impl App {
         }
     }
 
+    /// The list of the current tab, the one the keys move in.
+    fn list_state(&mut self) -> &mut TableState {
+        match self.tab {
+            0 => &mut self.work_state,
+            1 => &mut self.log_state,
+            2 => &mut self.stats_state,
+            _ => &mut self.branch_state,
+        }
+    }
+
+    /// Selects row `i` of the current tab's list, unless it is one the keys pass over:
+    /// a section header or a row of graph lines. Returns whether it did.
+    fn select_row(&mut self, i: usize) -> bool {
+        let ok = match self.tab {
+            0 => matches!(self.work_rows.get(i), Some(WorkRow::File { .. })),
+            1 => self.log.as_ref().and_then(|l| l.rows.get(i)).is_some_and(|r| r.commit.is_some()),
+            2 => self.stats.as_ref().is_some_and(|s| i < s.by_day.len()),
+            _ => self.branches.as_ref().is_some_and(|b| i < b.list.len()),
+        };
+        if ok {
+            self.list_state().select(Some(i));
+        }
+        ok
+    }
+
+    /// Selects `day` in By day, which has its numbers. A day without commits in the
+    /// range has no row there, and nothing changes.
+    fn select_day(&mut self, day: i32) {
+        let row = self.stats.as_ref().and_then(|s| s.by_day.iter().position(|b| day_number(&b.key) == Some(day)));
+        if row.is_some() {
+            self.stats_state.select(row);
+        }
+    }
+
     fn open_selected(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         let args: Vec<String> = match self.tab {
             0 => {
@@ -903,11 +995,14 @@ impl App {
             }
             _ => return Ok(()),
         };
+        // less gets the mouse back, so the wheel scrolls it as it always did.
         disable_raw_mode()?;
+        mouse_reports(false)?;
         execute!(io::stdout(), LeaveAlternateScreen, cursor::Show)?;
         let res = page_git(&self.repo.root, &args);
         enable_raw_mode()?;
         execute!(io::stdout(), EnterAlternateScreen, cursor::Hide)?;
+        mouse_reports(true)?;
         // Force a full redraw. Not `terminal.clear()`: it queries the cursor
         // position (DSR) and errors out on terminals that never answer it.
         let size = terminal.size()?;
@@ -955,9 +1050,54 @@ impl App {
         Ok(())
     }
 
+    fn on_mouse(&mut self, m: MouseEvent, terminal: &mut DefaultTerminal) -> io::Result<()> {
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => self.click(Position::new(m.column, m.row), Instant::now()),
+            // Not on the press: the release could then be reported after less has
+            // started, and less would read the report as keys.
+            MouseEventKind::Up(MouseButton::Left) if self.open_on_release => {
+                self.open_on_release = false;
+                self.open_selected(terminal)?;
+            }
+            // With mouse reports on, the terminal sends the wheel here instead of
+            // turning it into arrow keys.
+            MouseEventKind::ScrollDown => self.move_sel(1),
+            MouseEventKind::ScrollUp => self.move_sel(-1),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// A left press at `at`. A second one on the same row within `DOUBLE_CLICK` opens
+    /// the row when the button comes up.
+    fn click(&mut self, at: Position, now: Instant) {
+        let last = self.last_click.take();
+        self.open_on_release = false;
+        match self.targets.iter().find(|(area, _)| area.contains(at)).map(|(_, t)| *t) {
+            Some(Target::Tab(i)) => self.tab = i,
+            Some(Target::Range(i)) if i != self.range => {
+                self.range = i;
+                self.spawn_stats();
+            }
+            Some(Target::Day(day)) => self.select_day(day),
+            Some(Target::Row(i)) => {
+                let again = last.is_some_and(|(when, tab, row)| {
+                    (tab, row) == (self.tab, i) && now.duration_since(when) <= DOUBLE_CLICK
+                });
+                if again && self.list_state().selected() == Some(i) {
+                    self.open_on_release = true;
+                } else if self.select_row(i) {
+                    self.last_click = Some((now, self.tab, i));
+                }
+            }
+            _ => {}
+        }
+    }
+
     // ------------------------------------------------------------ render
 
     fn render(&mut self, f: &mut Frame) {
+        self.targets.clear();
         // The tab bar and the key hints are boxed like the panels between
         // them, so each takes three rows.
         let [top, body, bottom] =
@@ -972,9 +1112,13 @@ impl App {
         self.render_bottom(f, bottom);
     }
 
-    fn render_top(&self, f: &mut Frame, area: Rect) {
+    fn render_top(&mut self, f: &mut Frame, area: Rect) {
         let branch = self.work.as_ref().map_or("…", |w| w.branch.as_str());
         let line = top_line(area.width, &repo_name(&self.repo.root), branch, self.tab);
+        let inner = area.inner(Margin::new(1, 1));
+        for (i, x) in tab_cells(&line).into_iter().enumerate() {
+            self.targets.push((row_cells(inner, x), Target::Tab(i)));
+        }
         f.render_widget(Paragraph::new(line).block(panel()), area);
     }
 
@@ -1025,6 +1169,7 @@ impl App {
             })
             .collect();
         f.render_stateful_widget(file_table(rows, &cols).block(block), area, &mut self.work_state);
+        self.targets.extend(row_targets(area, self.work_state.offset(), self.work_rows.len()));
     }
 
     fn render_log(&mut self, f: &mut Frame, area: Rect) {
@@ -1037,6 +1182,7 @@ impl App {
         let title = first_fit(top.width, vec![title, Line::from(" Log ")]);
         let table = log_table(log, top.width).block(panel().title(title));
         f.render_stateful_widget(table, top, &mut self.log_state);
+        self.targets.extend(row_targets(top, self.log_state.offset(), log.rows.len()));
 
         let block = panel();
         let Some(c) = self.selected_commit() else {
@@ -1065,7 +1211,16 @@ impl App {
             (None, Some(e)) => message(e.clone(), DEL, panel().title(" Lines changed per day ")),
             (None, None) => message("loading…", DIM, panel().title(" Lines changed per day ")),
         };
-        draw_stats(f, area, s, self.range, &mut self.stats_state, Some(map));
+        let [head, band, days] = draw_stats(f, area, s, self.range, &mut self.stats_state, Some(map));
+        // The range pills are on the top border of the head.
+        let border = Rect { height: head.height.min(1), ..head }.inner(Margin::new(1, 0));
+        for (i, x) in range_cells(self.range, area.width).into_iter().enumerate() {
+            self.targets.push((row_cells(border, x), Target::Range(i)));
+        }
+        if let Some(m) = self.heat.as_ref().filter(|_| band.height > 0) {
+            self.targets.extend(heat_days(m, band).into_iter().map(|(cell, day)| (cell, Target::Day(day))));
+        }
+        self.targets.extend(row_targets(days, self.stats_state.offset(), s.by_day.len()));
     }
 
     fn render_branches(&mut self, f: &mut Frame, area: Rect) {
@@ -1083,6 +1238,7 @@ impl App {
         let [top, bottom] = Layout::vertical([Constraint::Length(list_h), Constraint::Fill(1)]).areas(area);
         let table = branch_table(&br.list, top.width).block(panel().title(title));
         f.render_stateful_widget(table, top, &mut self.branch_state);
+        self.targets.extend(row_targets(top, self.branch_state.offset(), br.list.len()));
 
         let Some(b) = self.selected_branch() else {
             f.render_widget(panel(), bottom);
@@ -1543,9 +1699,9 @@ fn worktree_note(path: &str, area_w: u16) -> String {
     }
 }
 
-/// The box at the top of the Stats tab. Everything in it goes whole: the words
-/// before the range pills, then the note, then the net count.
-fn stats_head(s: &Stats, range: usize, area_w: u16) -> Paragraph<'static> {
+/// The title of the box at the top of the Stats tab: words that go whole, then the
+/// range pills, from its second span on (see `range_cells`).
+fn stats_title(range: usize, area_w: u16) -> Line<'static> {
     let mut pills = Vec::new();
     for (i, (n, _)) in RANGES.iter().enumerate() {
         let label = format!(" {n} ");
@@ -1557,8 +1713,17 @@ fn stats_head(s: &Stats, range: usize, area_w: u16) -> Paragraph<'static> {
     }
     pills.push(Span::raw(" "));
     let title = |lead: &'static str| Line::from([vec![Span::raw(lead)], pills.clone()].concat());
-    let title = first_fit(area_w, vec![title(" Stats · range "), title(" Stats "), title(" ")]);
+    first_fit(area_w, vec![title(" Stats · range "), title(" Stats "), title(" ")])
+}
 
+/// Where each range pill is on the title from [`stats_title`].
+fn range_cells(range: usize, area_w: u16) -> Vec<Range<usize>> {
+    pill_cells(&stats_title(range, area_w), 1, RANGES.len())
+}
+
+/// The box at the top of the Stats tab. Everything in it goes whole: the words
+/// before the range pills, then the note, then the net count.
+fn stats_head(s: &Stats, range: usize, area_w: u16) -> Paragraph<'static> {
     let totals = vec![
         Span::raw(" "),
         Span::styled(format!("{} commits", s.commits), Style::new().bold()),
@@ -1575,11 +1740,12 @@ fn stats_head(s: &Stats, range: usize, area_w: u16) -> Paragraph<'static> {
         area_w,
         vec![Line::from([with_net.clone(), vec![note]].concat()), Line::from(with_net), Line::from(totals)],
     );
-    Paragraph::new(summary).block(panel().title(title))
+    Paragraph::new(summary).block(panel().title(stats_title(range, area_w)))
 }
 
 /// The Stats tab. A terminal too short for both keeps the tables, which have the
-/// numbers, and leaves out `map`.
+/// numbers, and leaves out `map`. Returns where the head, the map (no rows when it
+/// is left out) and By day went.
 fn draw_stats(
     f: &mut Frame,
     area: Rect,
@@ -1587,7 +1753,7 @@ fn draw_stats(
     range: usize,
     state: &mut TableState,
     map: Option<Paragraph<'static>>,
-) {
+) -> [Rect; 3] {
     let map = map.filter(|_| area.height >= 3 + HEAT_H + HEAT_TABLES);
     let map_h = if map.is_some() { HEAT_H } else { 0 };
     let [head, band, body] =
@@ -1606,6 +1772,7 @@ fn draw_stats(
     f.render_widget(dirs.block(panel().title(title)), rtop);
     let authors = bucket_table(&s.by_author, rbot.width, NAME_KEY, clip);
     f.render_widget(authors.block(boxed(" By author ")), rbot);
+    [head, band, left]
 }
 
 /// Days since 1970-01-01 of a `YYYY-MM-DD` date, from Howard Hinnant's
@@ -1792,6 +1959,27 @@ fn heat_panel(map: &Heatmap, area_w: u16, selected: Option<i32>) -> Paragraph<'s
     Paragraph::new(heat_lines(map, HEAT_DAY, weeks, spare, selected)).block(block)
 }
 
+/// Where [`heat_panel`] draws each day in a panel at `area`, for clicks: past the day
+/// names, below the months, in the columns of [`heat_lines`]. The days still to come
+/// are blank and left out.
+fn heat_days(map: &Heatmap, area: Rect) -> Vec<(Rect, i32)> {
+    let (weeks, spare) = heat_fit(area.width);
+    let first = heat_first(map.today, weeks);
+    let inner = area.inner(Margin::new(1, 1));
+    let mut days = Vec::new();
+    for (w, x) in heat_columns(first, weeks, HEAT_DAY, spare).into_iter().enumerate() {
+        for row in 0..7 {
+            let day = first + (7 * w + row) as i32;
+            let x = inner.x.saturating_add((HEAT_LABEL + x) as u16);
+            let cell = Rect::new(x, inner.y.saturating_add(1 + row as u16), HEAT_DAY as u16, 1).intersection(inner);
+            if day <= map.today && !cell.is_empty() {
+                days.push((cell, day));
+            }
+        }
+    }
+    days
+}
+
 /// A day that does not fit loses its year first: `11-01`.
 fn fit_day(day: &str, width: usize) -> String {
     if cells(day) <= width {
@@ -1928,11 +2116,30 @@ fn page_git(root: &Path, args: &[String]) -> Result<(), String> {
     status.map(|_| ()).map_err(|e| format!("failed to run less: {e}"))
 }
 
+/// Turns the terminal's mouse reports on or off: presses, releases and the wheel
+/// (mode 1000), in SGR form (1006), which has no limit on the column. Not crossterm's
+/// `EnableMouseCapture`, which also asks for every move of the pointer (1002, 1003):
+/// each would cost a redraw.
+fn mouse_reports(on: bool) -> io::Result<()> {
+    let codes: &[u8] = if on { b"\x1b[?1000h\x1b[?1006h" } else { b"\x1b[?1006l\x1b[?1000l" };
+    let mut out = io::stdout();
+    out.write_all(codes)?;
+    out.flush()
+}
+
 fn run_tui(repo: Arc<Repo>, o: &Opts) -> Result<(), String> {
     let mut terminal = ratatui::init();
+    // ratatui's panic hook restores the terminal but leaves the mouse reports on, and
+    // the shell would then print every click.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = mouse_reports(false);
+        hook(info);
+    }));
     let mut app = App::new(repo, o);
     app.refresh_all();
     let res = (|| -> io::Result<()> {
+        mouse_reports(true)?;
         while !app.quit {
             while let Ok(msg) = app.rx.try_recv() {
                 app.handle_msg(msg);
@@ -1941,15 +2148,17 @@ fn run_tui(repo: Arc<Repo>, o: &Opts) -> Result<(), String> {
                 app.spawn_work();
             }
             terminal.draw(|f| app.render(f))?;
-            if event::poll(Duration::from_millis(100))?
-                && let Event::Key(k) = event::read()?
-                && k.kind == KeyEventKind::Press
-            {
-                app.on_key(k.code, k.modifiers, &mut terminal)?;
+            if event::poll(Duration::from_millis(100))? {
+                match event::read()? {
+                    Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(k.code, k.modifiers, &mut terminal)?,
+                    Event::Mouse(m) => app.on_mouse(m, &mut terminal)?,
+                    _ => {}
+                }
             }
         }
         Ok(())
     })();
+    let _ = mouse_reports(false);
     ratatui::restore();
     res.map_err(|e| e.to_string())
 }
@@ -1959,6 +2168,7 @@ mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::layout::Offset;
 
     fn stat(path: &str, added: u64, deleted: u64) -> FileStat {
         FileStat { path: path.into(), old_path: None, added: Some(added), deleted: Some(deleted) }
@@ -3421,6 +3631,320 @@ mod tests {
             for tab in 0..TABS.len() {
                 draw_top(width.max(1), "demo", LONG_BRANCH, tab);
                 top_line(width, "", "", tab);
+            }
+        }
+    }
+
+    /// An App with something in every tab, given to it the way the background jobs
+    /// do, and no repository behind it. Only a new Stats range would run git, and it
+    /// fails at once.
+    fn sample_app() -> App {
+        let repo = Arc::new(Repo::at(PathBuf::from("/nonexistent/demo")));
+        let mut app = App::new(repo, &Opts { path: PathBuf::new(), once: false, limit: 300, range: 1 });
+        app.handle_msg(Msg::Work(Ok(WorkTree {
+            branch: "main".into(),
+            staged: vec![stat("src/main.rs", 12, 3)],
+            unstaged: vec![stat("README.md", 4, 0), stat("src/git.rs", 1, 1)],
+            untracked: vec![stat("notes.txt", 7, 0)],
+            ..Default::default()
+        })));
+        app.handle_msg(Msg::Log(0, Ok(sample_log())));
+        app.handle_msg(Msg::Stats(0, Ok(sample_stats())));
+        app.handle_msg(Msg::Heat(0, Ok(map_of(sample_days()))));
+        app.handle_msg(Msg::Branches(0, Ok(Branches { head_name: "main".into(), list: sample_branches() })));
+        app
+    }
+
+    /// [`sample_app`] with forty rows in every list, so each one scrolls.
+    fn long_app() -> App {
+        let mut app = sample_app();
+        let files = (0..40).map(|i| stat(&format!("src/f{i:02}.rs"), 1, 0)).collect();
+        app.handle_msg(Msg::Work(Ok(WorkTree { branch: "main".into(), unstaged: files, ..Default::default() })));
+        let commits = (0..40).map(|i| commit(&format!("{i:07}"), &format!("Subject {i:02}"), "Zhimin Chen", 1));
+        app.handle_msg(Msg::Log(0, Ok(log_of(commits.collect()))));
+        let days = (0..40).map(|i| bucket(&format!("2026-{:02}-{:02}", 1 + i / 28, 1 + i % 28), 1, 1, 0)).collect();
+        app.handle_msg(Msg::Stats(0, Ok(Stats { by_day: days, ..sample_stats() })));
+        let list = (0..40).map(|i| branch(&format!("agent/b{i:02}"), 1, 0, 1)).collect();
+        app.handle_msg(Msg::Branches(0, Ok(Branches { head_name: "main".into(), list })));
+        app
+    }
+
+    fn draw_app(app: &mut App, width: u16, height: u16) -> Terminal<TestBackend> {
+        let mut t = Terminal::new(TestBackend::new(width, height)).unwrap();
+        t.draw(|f| app.render(f)).unwrap();
+        t
+    }
+
+    /// A cell where the last frame put `target`.
+    fn spot(app: &App, target: Target) -> Position {
+        let found = app.targets.iter().find(|(area, t)| *t == target && !area.is_empty());
+        found.map(|(area, _)| area.as_position()).unwrap_or_else(|| panic!("{target:?} is not on the screen"))
+    }
+
+    fn text_in(t: &Terminal<TestBackend>, area: Rect) -> String {
+        let b = t.backend().buffer();
+        area.positions().map(|p| b[p].symbol()).collect()
+    }
+
+    /// Text that row `i` of the current tab's list shows at any of the sizes tested.
+    fn row_label(app: &App, i: usize) -> String {
+        let last = |path: &str| path.rsplit('/').next().unwrap().to_string();
+        match app.tab {
+            0 => match &app.work_rows[i] {
+                WorkRow::Header { title, .. } => title.to_string(),
+                WorkRow::File { file, .. } => last(&file.path),
+            },
+            1 => {
+                let log = app.log.as_ref().unwrap();
+                log.rows[i].commit.map_or("|".to_string(), |c| log.commits[c].subject.chars().take(10).collect())
+            }
+            2 => app.stats.as_ref().unwrap().by_day[i].key[5..].to_string(),
+            _ => last(&app.branches.as_ref().unwrap().list[i].name),
+        }
+    }
+
+    /// A pill or a pill slot as drawn: its caps, and its label between two spaces.
+    fn pill_text(label: &str, active: bool) -> String {
+        let (l, r) = if active { (PILL_L, PILL_R) } else { (" ", " ") };
+        format!("{l} {label} {r}")
+    }
+
+    /// Tab `i` as the top bar can draw it while `tab` is active: with its name or not.
+    fn tab_pills(i: usize, tab: usize) -> [String; 2] {
+        [pill_text(&(i + 1).to_string(), i == tab), pill_text(&format!("{} {}", i + 1, TABS[i]), i == tab)]
+    }
+
+    #[test]
+    fn clicks_land_on_what_the_frame_shows() {
+        // The user's side pane and window, and sizes around them.
+        for (width, height) in [(53u16, 22u16), (60, 30), (80, 24), (108, 40), (200, 50)] {
+            let mut app = sample_app();
+            for tab in 0..TABS.len() {
+                app.tab = tab;
+                let t = draw_app(&mut app, width, height);
+                let id = format!("{width}x{height} tab {tab}");
+                let targets: Vec<(Rect, Target)> = app.targets.iter().copied().filter(|(a, _)| !a.is_empty()).collect();
+                // A click finds one target at most, and only on the screen.
+                for (i, (a, _)) in targets.iter().enumerate() {
+                    assert_eq!(a.intersection(t.backend().buffer().area), *a, "{id}: {a:?}");
+                    for (b, _) in &targets[i + 1..] {
+                        assert!(!a.intersects(*b), "{id}: {a:?} and {b:?} overlap");
+                    }
+                }
+                assert_eq!(targets.iter().filter(|(_, t)| matches!(t, Target::Tab(_))).count(), TABS.len(), "{id}");
+                assert!(targets.iter().any(|(_, t)| matches!(t, Target::Row(_))), "{id}");
+                for (area, target) in &targets {
+                    let text = text_in(&t, *area);
+                    let ok = match *target {
+                        // The whole pill, caps and all, and nothing else.
+                        Target::Tab(i) => tab_pills(i, tab).contains(&text),
+                        Target::Range(i) => text == pill_text(RANGES[i].0, i == app.range),
+                        Target::Row(i) => text.contains(&row_label(&app, i)),
+                        // Checked against the map on its own.
+                        Target::Day(_) => true,
+                    };
+                    assert!(ok, "{id}: {target:?} at {area:?} shows {text:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_click_selects_its_row_but_not_a_header_or_graph_lines() {
+        let mut app = sample_app();
+        let now = Instant::now();
+        draw_app(&mut app, 80, 24);
+        assert_eq!(app.work_state.selected(), Some(1));
+        app.click(spot(&app, Target::Row(4)), now);
+        assert_eq!(app.work_state.selected(), Some(4));
+        // The Unstaged header.
+        app.click(spot(&app, Target::Row(2)), now);
+        assert_eq!(app.work_state.selected(), Some(4));
+        app.tab = 1;
+        draw_app(&mut app, 80, 24);
+        app.click(spot(&app, Target::Row(1)), now);
+        assert_eq!(app.log_state.selected(), Some(1));
+        // The connector row below the last commit.
+        app.click(spot(&app, Target::Row(2)), now);
+        assert_eq!(app.log_state.selected(), Some(1));
+        for (tab, row) in [(2, 2), (3, 1)] {
+            app.tab = tab;
+            draw_app(&mut app, 80, 24);
+            app.click(spot(&app, Target::Row(row)), now);
+            assert_eq!(app.list_state().selected(), Some(row), "tab {tab}");
+            // A border, and the rows below the list.
+            let border = spot(&app, Target::Row(0)) - Offset::new(0, 1);
+            for at in [border, spot(&app, Target::Row(row)) + Offset::new(0, 1)] {
+                app.click(at, now);
+                assert_eq!(app.list_state().selected(), Some(row), "tab {tab}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_click_finds_its_row_in_a_scrolled_list() {
+        let mut app = long_app();
+        for tab in 0..TABS.len() {
+            app.tab = tab;
+            app.move_sel(1_000_000);
+            let t = draw_app(&mut app, 80, 24);
+            let first = app.list_state().offset();
+            assert!(first > 0, "tab {tab}");
+            let rows: Vec<(Rect, usize)> = app
+                .targets
+                .iter()
+                .filter_map(|(area, t)| if let Target::Row(i) = t { Some((*area, *i)) } else { None })
+                .collect();
+            assert_eq!(rows[0].1, first, "tab {tab}");
+            for (area, i) in rows {
+                let (text, want) = (text_in(&t, area), row_label(&app, i));
+                assert!(text.contains(&want), "tab {tab}: row {i} at {area:?} shows {text:?}, not {want}");
+            }
+            app.click(spot(&app, Target::Row(first + 1)), Instant::now());
+            assert_eq!(app.list_state().selected(), Some(first + 1), "tab {tab}");
+        }
+    }
+
+    #[test]
+    fn a_double_click_opens_its_row_when_the_button_comes_up() {
+        let mut app = sample_app();
+        draw_app(&mut app, 80, 24);
+        let (readme, git) = (spot(&app, Target::Row(3)), spot(&app, Target::Row(4)));
+        let t0 = Instant::now();
+        let ms = |n| t0 + Duration::from_millis(n);
+        app.click(readme, t0);
+        assert_eq!(app.work_state.selected(), Some(3));
+        assert!(!app.open_on_release);
+        app.click(readme, ms(500));
+        assert!(app.open_on_release);
+        // A third press starts over, and a second one too late is a click of its own.
+        app.click(readme, ms(600));
+        assert!(!app.open_on_release);
+        app.click(readme, ms(1101));
+        assert!(!app.open_on_release);
+        // Two rows are two clicks.
+        app.click(git, ms(1200));
+        assert!(!app.open_on_release);
+        assert_eq!(app.work_state.selected(), Some(4));
+        // A row the keys moved away from in between gets selected again, not opened.
+        app.click(git, ms(2000));
+        app.move_sel(-1);
+        app.click(git, ms(2100));
+        assert!(!app.open_on_release);
+        assert_eq!(app.work_state.selected(), Some(4));
+        // A press anywhere else in between.
+        app.click(readme, ms(3000));
+        app.click(spot(&app, Target::Tab(0)), ms(3100));
+        app.click(readme, ms(3200));
+        assert!(!app.open_on_release);
+        // The same row on another tab.
+        app.click(readme, ms(4000));
+        app.tab = 3;
+        app.click(readme, ms(4100));
+        assert!(!app.open_on_release);
+    }
+
+    #[test]
+    fn a_click_on_a_tab_or_a_range_pill_picks_it() {
+        let mut app = sample_app();
+        for width in [23u16, 40, 53, 80, 120] {
+            for tab in [3, 0, 2, 1] {
+                draw_app(&mut app, width, 24);
+                app.click(spot(&app, Target::Tab(tab)), Instant::now());
+                assert_eq!(app.tab, tab, "width {width}");
+            }
+        }
+        app.tab = 2;
+        for range in [3, 0, 2, 1] {
+            draw_app(&mut app, 80, 24);
+            app.click(spot(&app, Target::Range(range)), Instant::now());
+            assert_eq!(app.range, range);
+        }
+    }
+
+    #[test]
+    fn each_tab_is_found_where_the_top_bar_draws_it() {
+        for (repo, branch) in [("demo", "main"), ("diffdash", "narrow-panes"), ("demo", LONG_BRANCH)] {
+            for tab in 0..TABS.len() {
+                for width in 23..=200u16 {
+                    let row: Vec<char> = draw_top(width, repo, branch, tab).0.chars().collect();
+                    let tabs = tab_cells(&top_line(width, repo, branch, tab));
+                    for (i, x) in tabs.iter().enumerate() {
+                        let text: String = row[1 + x.start..1 + x.end].iter().collect();
+                        assert!(tab_pills(i, tab).contains(&text), "width {width} tab {tab}: {text:?}");
+                        // The tabs touch, so no click between two of them misses.
+                        assert!(i == 0 || tabs[i - 1].end == x.start, "width {width} tab {tab}");
+                    }
+                    assert!(tabs[TABS.len() - 1].end <= width as usize - 2, "width {width} tab {tab}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn each_range_is_found_where_the_stats_head_draws_it() {
+        let s = Stats::default();
+        for range in 0..RANGES.len() {
+            for width in 31..=120u16 {
+                let row: Vec<char> = draw_head(width, &s, range)[0].chars().collect();
+                for (i, x) in range_cells(range, width).into_iter().enumerate() {
+                    let text: String = row[1 + x.start..1 + x.end].iter().collect();
+                    assert_eq!(text, pill_text(RANGES[i].0, i == range), "width {width} range {range}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn heatmap_days_are_where_the_map_draws_them() {
+        let today = day(MAP_TODAY);
+        let days = (today - 400..=today).map(|d| (d, (4, bucket("", 1, 1, 0)))).collect();
+        let map = Heatmap { today, days };
+        for width in [10u16, 40, 53, 60, 108, 114, 125, 240] {
+            let found = heat_days(&map, Rect::new(0, 0, width, HEAT_H));
+            // Every day of the weeks shown up to today, a Thursday.
+            assert_eq!(found.len(), heat_fit(width).0 * 7 - 2, "width {width}");
+            for (cell, d) in found {
+                let t = draw_map(width, &map, Some(d));
+                let b = t.backend().buffer();
+                let reversed: Vec<Position> =
+                    b.area.positions().filter(|p| b[*p].modifier.contains(Modifier::REVERSED)).collect();
+                assert_eq!(reversed, cell.positions().collect::<Vec<_>>(), "width {width} day {d}");
+            }
+        }
+        assert!(heat_days(&map, Rect::new(0, 0, 9, HEAT_H)).is_empty());
+    }
+
+    #[test]
+    fn a_click_on_a_heatmap_day_selects_it_in_by_day() {
+        let mut app = sample_app();
+        app.tab = 2;
+        draw_app(&mut app, 108, 40);
+        assert_eq!(app.stats_state.selected(), Some(0));
+        app.click(spot(&app, Target::Day(day("2026-09-01"))), Instant::now());
+        assert_eq!(app.stats_state.selected(), Some(1));
+        // A day without commits has no row in By day.
+        app.click(spot(&app, Target::Day(day(MAP_TODAY))), Instant::now());
+        assert_eq!(app.stats_state.selected(), Some(1));
+        // A terminal too short for the map has no days to click.
+        draw_app(&mut app, 108, 28);
+        assert!(!app.targets.iter().any(|(_, t)| matches!(t, Target::Day(_))));
+    }
+
+    #[test]
+    fn tiny_apps_do_not_panic() {
+        let mut app = sample_app();
+        for width in 1..40u16 {
+            for height in 1..12u16 {
+                for tab in 0..TABS.len() {
+                    app.tab = tab;
+                    draw_app(&mut app, width, height);
+                    // A new range would start a git job each time.
+                    let targets = app.targets.clone().into_iter().filter(|(_, t)| !matches!(t, Target::Range(_)));
+                    for (area, _) in targets {
+                        app.click(area.as_position(), Instant::now());
+                    }
+                }
             }
         }
     }

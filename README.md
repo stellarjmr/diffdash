@@ -65,6 +65,16 @@ r                 refresh now
 q / Esc           quit
 ```
 
+Mouse:
+
+```
+click             switch tab, select a row, a Stats range or a heatmap day
+double-click      open the row in less, like Enter
+wheel             move, like j k
+```
+
+A day on the heatmap selects its row in By day, so a day with no commits in the range does nothing. diffdash asks the terminal for clicks and the wheel only, not for pointer motion. While it runs, the terminal selects text only with a modifier held as you drag, Shift in Ghostty. less gets the mouse back while it shows a diff, so the wheel scrolls it as before.
+
 ## How numbers are counted
 
 - Line counts come from `git diff --numstat` and `git log --numstat`. Binary files show `bin` and add nothing to totals.
