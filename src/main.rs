@@ -1,10 +1,12 @@
 mod git;
+mod pager;
+mod syntax;
 
 use std::collections::HashMap;
 use std::io::{self, Write as _};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -967,7 +969,8 @@ impl App {
                     Kind::Unstaged => vec!["diff".into()],
                     Kind::Untracked => vec!["diff".into(), "--no-index".into()],
                 };
-                a.push("--color=always".into());
+                // Plain text: diffdash paints it (see `pager`).
+                a.push("--no-color".into());
                 a.push("--".into());
                 if kind == Kind::Untracked {
                     a.push("/dev/null".into());
@@ -979,7 +982,7 @@ impl App {
             }
             1 => {
                 let Some(c) = self.selected_commit() else { return Ok(()) };
-                vec!["show".into(), "--color=always".into(), "--stat".into(), "--patch".into(), c.hash.clone()]
+                vec!["show".into(), "--no-color".into(), "--stat".into(), "--patch".into(), c.hash.clone()]
             }
             3 => {
                 // The whole branch since the merge base, the same range the
@@ -989,7 +992,7 @@ impl App {
                 if c.files.is_empty() {
                     return Ok(());
                 }
-                let mut a: Vec<String> = ["diff", "--color=always", "--stat", "--patch"].map(String::from).into();
+                let mut a: Vec<String> = ["diff", "--no-color", "--stat", "--patch"].map(String::from).into();
                 a.extend([c.merge_base.clone(), b.tip.clone(), "--".into()]);
                 a
             }
@@ -999,7 +1002,7 @@ impl App {
         disable_raw_mode()?;
         mouse_reports(false)?;
         execute!(io::stdout(), LeaveAlternateScreen, cursor::Show)?;
-        let res = page_git(&self.repo.root, &args);
+        let res = pager::page(&self.repo.root, &args);
         enable_raw_mode()?;
         execute!(io::stdout(), EnterAlternateScreen, cursor::Hide)?;
         mouse_reports(true)?;
@@ -2098,22 +2101,6 @@ fn clamp(state: &mut TableState, len: usize) {
         (Some(i), n) if i >= n => state.select(Some(n - 1)),
         _ => {}
     }
-}
-
-/// Pipe `git <args>` into `less -R`.
-fn page_git(root: &Path, args: &[String]) -> Result<(), String> {
-    let mut git = git::git_cmd(root)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("failed to run git: {e}"))?;
-    let out = git.stdout.take().ok_or("no git output")?;
-    // -+F overrides a user's LESS=-F, which would make less quit at once on a
-    // short diff and look like Enter did nothing.
-    let status = Command::new("less").args(["-R", "-+F"]).stdin(out).status();
-    let _ = git.wait();
-    status.map(|_| ()).map_err(|e| format!("failed to run less: {e}"))
 }
 
 /// Turns the terminal's mouse reports on or off: presses, releases and the wheel

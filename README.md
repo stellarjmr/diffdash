@@ -75,6 +75,12 @@ wheel             move, like j k
 
 A day on the heatmap selects its row in By day, so a day with no commits in the range does nothing. diffdash asks the terminal for clicks and the wheel only, not for pointer motion. While it runs, the terminal selects text only with a modifier held as you drag, Shift in Ghostty. less gets the mouse back while it shows a diff, so the wheel scrolls it as before.
 
+## Diffs
+
+git paints a whole changed line red or green, so a changed comment looks just like changed code. diffdash asks git for plain text and colors the diff behind Enter itself: git's default colors, with comments faint. On a changed line a comment keeps the line's red or green, only dimmed, so the change still shows; on an unchanged line it is the plain text color, dimmed. A Python docstring counts as a comment, unless it began above the hunk: then the part in the hunk reads as code, because the quotes that close it cannot be told from quotes that open one.
+
+diffdash knows the comments of about 70 languages and file types, by file name and extension: Rust, C, C++, Go, Java, Kotlin, Swift, C#, JavaScript, TypeScript, Python, shell, Ruby, Lua, SQL, Haskell, Fortran, TeX, CSS, HTML, Markdown, YAML, TOML, JSON, Makefile, Dockerfile, Nix and others. Other files look as git colors them. It also knows the strings of these languages, so that `"http://…"` or `"#"` does not read as a comment. Each hunk is read on its own, so one that starts inside a long block comment or string can be colored wrong until that ends. In C-style languages other than Rust and CSS, a hunk that starts with ` * ` lines is taken to be inside a `/** … */` block.
+
 ## How numbers are counted
 
 - Line counts come from `git diff --numstat` and `git log --numstat`. Binary files show `bin` and add nothing to totals.
@@ -86,7 +92,7 @@ A day on the heatmap selects its row in By day, so a day with no commits in the 
 - Branches counts committed work only. A branch checked out in another worktree is tagged `worktree`; its uncommitted changes are not included (run `diffdash <that worktree>` to see them). A branch that shares no history with HEAD shows `no common history`. Only local branches are listed, not remote-tracking ones.
 - The 2 s poll also reads the branch tips (one `git for-each-ref`). Branches reloads when a tip or HEAD moves, and only branches whose tip or HEAD changed are recomputed.
 - All git calls pass `--no-optional-locks` and `-c diff.autoRefreshIndex=false`, so the 2 s polling never rewrites `.git/index` or holds `.git/index.lock`, and cannot make a `git commit` running at the same time fail. The second setting is needed because `git diff` otherwise refreshes the index when a tracked file was rewritten with unchanged content, `--no-optional-locks` or not. That refresh is left to your own next git command.
-- Diffs open in `less -R -+F`. `-+F` overrides a `LESS=-F` setting, which would otherwise close short diffs at once.
+- Diffs open in `less -R -+F`, colored by diffdash (see [Diffs](#diffs)). `-+F` overrides a `LESS=-F` setting, which would otherwise close short diffs at once.
 - Colors come from the terminal's ANSI palette and the selection uses reverse video, so the UI follows light and dark themes.
 - Panels have rounded corners, and the tab bar at the top and the key hints at the bottom sit in rounded boxes of their own. The active tab and Stats range are drawn as rounded pills using the Powerline half circles U+E0B6 and U+E0B4. Ghostty and kitty draw these glyphs themselves; other terminals need a Nerd Font or Powerline-patched font.
 - In a narrow pane, the file lists make room in this order: the padding of the number columns, then the bar, then the path. A path that still does not fit loses whole directories from the left, so the file name stays visible (`…/auth/login.rs`); only a file name wider than the column is itself cut (`…ogin.rs`). A rename that does not fit shows just its new path after an arrow (`→ …/auth/login.rs`). The diff behind Enter and `--once` always show full paths.

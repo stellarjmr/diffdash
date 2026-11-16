@@ -600,7 +600,7 @@ pub fn aggregate(commits: &[Commit]) -> Stats {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn fs(path: &str, a: Option<u64>, d: Option<u64>) -> FileStat {
@@ -711,7 +711,7 @@ mod tests {
     }
 
     /// Run git for test setup, isolated from the user's config (signing, hooks).
-    fn setup_git(dir: &Path, args: &[&str]) {
+    pub(crate) fn setup_git(dir: &Path, args: &[&str]) {
         let out = Command::new("git")
             .arg("-C")
             .arg(dir)
