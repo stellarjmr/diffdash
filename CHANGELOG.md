@@ -4,6 +4,8 @@ All notable changes to `diffdash` are tracked here.
 
 ## Unreleased
 
+## 0.5.0 - 2026-11-16
+
 - The diff behind Enter shows comments faint. git paints a whole changed line red or green, so a changed comment looked just like changed code, and a diff was hard to read. diffdash now asks git for plain text and colors it itself: git's default colors, with comments faint. On a changed line a comment keeps the line's red or green, only dimmed, so the change still shows; on an unchanged line it is the plain text color, dimmed. A Python docstring counts as a comment, unless it began above the hunk. diffdash knows the comments and strings of about 70 languages and file types, by file name and extension, and a file it does not know looks as before. This takes no new dependency: a small hand-written lexer per language, which reads strings only so that `"http://…"` or `"#"` is not taken for a comment. Only palette colors and the faint attribute are used, so the diff follows light and dark themes. Faint was picked over gray comments and over italic, which a terminal does not show when its font has no matching italic face.
 
 ## 0.4.0 - 2026-11-09
